@@ -7,7 +7,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --disable-warning=ExperimentalWarning test/*.test.ts"
+    "test": "node --test --disable-warning=ExperimentalWarning test/*.test.ts",
+    "verify:cli": "node --disable-warning=ExperimentalWarning scripts/verify-real-cli.ts"
   },
   "devDependencies": {
     "@types/node": "^24.13.6",
