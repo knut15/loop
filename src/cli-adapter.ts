@@ -21,7 +21,8 @@ export const claudeSessionId = (requestId: string) => requestId.replace(/^req-/,
 
 function command(kind: CliKind, requestId: string, prompt: string, model?: string): string[] {
   if (kind === 'claude') {
-    return ['claude', '-p', '--session-id', claudeSessionId(requestId), '--output-format', 'json',
+    // dontAsk: 권한이 필요한 도구 요청을 기다리지 않고 거절한다. 기다리면 -p 실행이 출력 없이 멈춘다
+    return ['claude', '-p', '--session-id', claudeSessionId(requestId), '--output-format', 'json', '--permission-mode', 'dontAsk',
       ...(model ? ['--model', model] : []), prompt];
   }
   // Codex 는 실행 ID 를 미리 정할 수 없다. 프롬프트에 request_id 를 넣어 세션 기록에서 찾게 한다
@@ -88,4 +89,23 @@ export class CliAdapter implements Adapter {
 export function isAlive(requestId: string): boolean {
   const out = execFileSync('ps', ['-axww', '-o', 'command='], { encoding: 'utf8' });
   return out.split('\n').some((line) => line.startsWith(`sh -c`) && line.includes(marker(requestId)));
+}
+
+// 끝난 작업자의 최종 응답을 읽는다. 총괄이 다음 작업 프롬프트에 결과를 옮겨 담을 때 쓴다
+export function readOutput(kind: CliKind, workdir: string, limit = 1000): string | undefined {
+  const file = path.join(workdir, 'out.jsonl');
+  if (!existsSync(file)) return undefined;
+  const raw = readFileSync(file, 'utf8');
+  try {
+    if (kind === 'claude') return String((JSON.parse(raw) as { result?: string }).result ?? '').slice(0, limit);
+    let last = '';
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      const ev = JSON.parse(line) as { type?: string; item?: { type?: string; text?: string } };
+      if (ev.type === 'item.completed' && ev.item?.type === 'agent_message') last = ev.item.text ?? '';
+    }
+    return last.slice(0, limit);
+  } catch {
+    return undefined;
+  }
 }

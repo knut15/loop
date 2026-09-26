@@ -22,9 +22,11 @@ export type Task = {
 export type TaskOptions = { prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number };
 export type Attempt = {
   id: string; task_id: string; request_id: string; workdir: string; prompt: string; status: AttemptStatus;
-  last_lookup: string | null;
+  last_lookup: string | null; started_at?: number | null;
 };
 export type Notify = (report: string) => void;
+// stallAfterMs: 작업자가 살아 있어도 이 시간을 넘기면 멈춤으로 알린다. 죽이거나 재시도하지는 않는다
+export type ManagerOptions = { stallAfterMs?: number; now?: () => number };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -36,15 +38,17 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
   request_id TEXT NOT NULL UNIQUE, workdir TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
-  last_lookup TEXT
+  last_lookup TEXT, started_at INTEGER
 );
 -- Task 하나에 권한 있는 시도는 동시에 1개까지
 CREATE UNIQUE INDEX IF NOT EXISTS one_live_attempt ON attempts(task_id)
   WHERE status IN ('intent', 'launched', 'launch_unknown');
 CREATE TABLE IF NOT EXISTS events (key TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS decisions (
-  id TEXT PRIMARY KEY, spec_version INTEGER NOT NULL, status TEXT NOT NULL, answer TEXT
+  id TEXT PRIMARY KEY, spec_version INTEGER NOT NULL, status TEXT NOT NULL, answer TEXT, question TEXT
 );
+-- 작업·시도에 묶이지 않는 멈춤(총괄 호출 실패 등). active 인 것만 attention 에 오른다
+CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, task_id TEXT, reason TEXT NOT NULL, next TEXT NOT NULL, active INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS history (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, task_id TEXT, attempt_id TEXT, kind TEXT NOT NULL, detail TEXT NOT NULL
 );
@@ -58,7 +62,12 @@ export class Manager {
   readonly workRoot: string;
   readonly notify: Notify | undefined;
 
-  constructor(dbPath: string, adapter: Adapter, workRoot: string, notify?: Notify) {
+  readonly stallAfterMs: number;
+  readonly now: () => number;
+
+  constructor(dbPath: string, adapter: Adapter, workRoot: string, notify?: Notify, opts: ManagerOptions = {}) {
+    this.stallAfterMs = opts.stallAfterMs ?? 15 * 60_000;
+    this.now = opts.now ?? Date.now;
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.db.exec(SCHEMA);
@@ -77,6 +86,8 @@ export class Manager {
       ['tasks', 'depends_on', `TEXT NOT NULL DEFAULT ''`],
       ['tasks', 'max_attempts', 'INTEGER NOT NULL DEFAULT 3'],
       ['attempts', 'last_lookup', 'TEXT'],
+      ['decisions', 'question', 'TEXT'],
+      ['attempts', 'started_at', 'INTEGER'],
     ];
     for (const [table, col, def] of add) {
       if (!has(table, col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
@@ -120,6 +131,62 @@ export class Manager {
   specVersion(): number {
     const row = this.db.prepare(`SELECT value FROM meta WHERE key = 'spec_version'`).get() as { value: string } | undefined;
     return row ? Number(row.value) : 1;
+  }
+
+  meta(key: string): string | undefined {
+    return (this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+  }
+
+  goal(): string {
+    return this.meta('goal') ?? '';
+  }
+
+  setGoal(goal: string): void {
+    this.setMeta('goal', goal);
+    this.log(null, null, 'goal_set', goal.split('\n')[0]!.slice(0, 120));
+  }
+
+  // 마지막 히스토리 번호. 총괄은 이 값이 바뀌었을 때만 다시 부른다
+  historySeq(): number {
+    return (this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS n FROM history').get() as { n: number }).n;
+  }
+
+  // 작업 상태를 바꾼 기록만 센 마지막 번호. 알림·거절·총괄 실패 같은 기록은 총괄을 다시 부를 이유가 아니다
+  stateSeq(): number {
+    return (this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM history
+      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called')`).get() as { n: number }).n;
+  }
+
+  attemptCounts(): Record<string, number> {
+    const rows = this.db.prepare('SELECT task_id, COUNT(*) AS n FROM attempts GROUP BY task_id').all() as { task_id: string; n: number }[];
+    return Object.fromEntries(rows.map((r) => [r.task_id, r.n]));
+  }
+
+  decisions(): { id: string; spec_version: number; status: string; question: string | null; answer: string | null }[] {
+    return this.db.prepare('SELECT id, spec_version, status, question, answer FROM decisions ORDER BY rowid').all() as never;
+  }
+
+  // 작업·시도에 묶이지 않는 멈춤을 올리거나 내린다
+  setFlag(key: string, taskId: string | null, reason: string, next: string): void {
+    this.db.prepare(`INSERT INTO flags (key, task_id, reason, next, active) VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT(key) DO UPDATE SET reason = excluded.reason, next = excluded.next, active = 1`).run(key, taskId, reason, next);
+  }
+
+  clearFlag(key: string): void {
+    this.db.prepare('UPDATE flags SET active = 0 WHERE key = ?').run(key);
+  }
+
+  clearFlagPrefix(prefix: string): void {
+    this.db.prepare(`UPDATE flags SET active = 0 WHERE key LIKE ? || '%'`).run(prefix);
+  }
+
+  // 총괄 호출에 관한 기록. 작업에 묶이지 않는다
+  noteCoordinator(kind: string, detail: string): void {
+    this.log(null, null, kind, detail);
   }
 
   setSpecVersion(v: number): void {
@@ -199,8 +266,8 @@ export class Manager {
       if (this.attemptCount(taskId) >= t.max_attempts) throw new Rejected(`시도 횟수 상한 ${t.max_attempts}회에 닿았다`);
       const id = randomUUID();
       const a: Attempt = { id, task_id: taskId, request_id: `req-${id}`, workdir: path.join(this.workRoot, id), prompt, status: 'intent', last_lookup: null };
-      this.db.prepare('INSERT INTO attempts (id, task_id, request_id, workdir, prompt, status) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(a.id, a.task_id, a.request_id, a.workdir, a.prompt, a.status);
+      this.db.prepare('INSERT INTO attempts (id, task_id, request_id, workdir, prompt, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(a.id, a.task_id, a.request_id, a.workdir, a.prompt, a.status, this.now());
       this.bump(taskId, 'running');
       this.log(taskId, id, 'intent', `실행 의도 저장 (${a.request_id})`);
       return a;
@@ -276,16 +343,30 @@ export class Manager {
         next: `시도 기록(history, 작업 디렉터리)을 보고 원인을 고친 뒤 grantAttempts('${t.id}', 1) 로 다시 허용한다`,
       });
     }
-    const open = this.db.prepare(`SELECT id, spec_version FROM decisions WHERE status = 'open' ORDER BY rowid`).all() as { id: string; spec_version: number }[];
+    // 살아 있지만 너무 오래 끝나지 않는 작업자. 권한 요청을 기다리며 멈춘 CLI 가 이렇게 보인다
+    const slow = this.db.prepare(`SELECT * FROM attempts WHERE status = 'launched' AND last_lookup = 'running'
+      AND started_at IS NOT NULL AND started_at < ? ORDER BY rowid`).all(this.now() - this.stallAfterMs) as Attempt[];
+    for (const a of slow) {
+      const min = Math.floor((this.now() - a.started_at!) / 60_000);
+      items.push({
+        key: `slow:${a.id}`,
+        taskId: a.task_id,
+        reason: `작업자가 ${min}분째 끝나지 않는다 (프로세스는 살아 있다)`,
+        next: `${a.workdir} 의 out.jsonl·err.txt 를 확인한다. 멈춘 것이면 표지 loop-ai:${a.request_id} 가 붙은 프로세스 그룹을 종료한다. 그러면 다음 tick 에 사라진 작업자로 보고되고 resolveUnknown 으로 판정할 수 있다`,
+      });
+    }
+    const open = this.db.prepare(`SELECT id, spec_version, question FROM decisions WHERE status = 'open' ORDER BY rowid`).all() as { id: string; spec_version: number; question: string | null }[];
     for (const d of open) {
       const blocked = (this.db.prepare(`SELECT id FROM tasks WHERE blocked_by = ?`).all(d.id) as { id: string }[]).map((t) => t.id);
       items.push({
         key: `decision:${d.id}`,
         taskId: blocked.join(', ') || null,
-        reason: `사용자 결정 ${d.id} 를 기다린다`,
+        reason: `사용자 결정 ${d.id} 를 기다린다${d.question ? `: ${d.question}` : ''}`,
         next: `answerDecision('${d.id}', ${d.spec_version}, '<응답>') 를 입력한다`,
       });
     }
+    const flags = this.db.prepare('SELECT * FROM flags WHERE active = 1 ORDER BY rowid').all() as { key: string; task_id: string | null; reason: string; next: string }[];
+    for (const f of flags) items.push({ key: f.key, taskId: f.task_id, reason: f.reason, next: f.next });
     return items;
   }
 
@@ -356,9 +437,9 @@ export class Manager {
     return !!this.db.prepare('SELECT 1 FROM decisions WHERE id = ?').get(id);
   }
 
-  openDecision(id: string): void {
-    this.db.prepare(`INSERT INTO decisions (id, spec_version, status) VALUES (?, ?, 'open')`).run(id, this.specVersion());
-    this.log(null, null, 'decision_opened', `결정 ${id} 를 사용자에게 요청`);
+  openDecision(id: string, question?: string): void {
+    this.db.prepare(`INSERT INTO decisions (id, spec_version, status, question) VALUES (?, ?, 'open', ?)`).run(id, this.specVersion(), question ?? null);
+    this.log(null, null, 'decision_opened', `결정 ${id} 를 사용자에게 요청${question ? `: ${question}` : ''}`);
     this.alertIfNeeded();
   }
 

@@ -11,14 +11,32 @@ goal 프롬프트와 스펙만 주면 여러 코딩 에이전트가 프로젝트
 
 ```bash
 pnpm install
-pnpm loop-ai init ./my-project --adapter claude --model haiku   # 또는 --adapter codex
-pnpm loop-ai add  ./my-project a --prompt "..."
-pnpm loop-ai add  ./my-project b --prompt "..." --after a
-pnpm loop-ai run  ./my-project --verify "pnpm test" --max 2      # 모든 작업이 done 이 될 때까지 돈다
+# LLM 총괄: goal 만 주면 총괄이 작업을 나누고 순서를 정한다
+pnpm loop-ai init ./my-project --adapter claude --model haiku --coordinator llm   # 또는 --adapter codex
+pnpm loop-ai goal ./my-project "만들 것을 설명한다"                                # 또는 @goal.md
+pnpm loop-ai run  ./my-project --verify "pnpm test" --max 2      # 총괄이 목표 완료라고 할 때까지 돈다
+
+# 규칙 기반 총괄(기본값): 작업을 직접 넣고, 넣은 순서대로 돈다
+pnpm loop-ai init ./other --adapter claude
+pnpm loop-ai add  ./other a --prompt "..."
+pnpm loop-ai add  ./other b --prompt "..." --after a
+pnpm loop-ai run  ./other --verify "pnpm test"
 pnpm loop-ai status ./my-project                                 # 멈춘 곳·작업·히스토리·다음에 할 일
 ```
 
 `run` 은 tick 마다 재조회와 멈춤 알림, 검증, 동시 실행 상한 안의 dispatch 를 한다. 멈춘 작업만 남아도 끝나지 않고 기다린다. 다른 터미널에서 `answer`(사용자 결정), `resolve`(멈춘 시도 판정), `grant`(시도 횟수 추가)를 입력하면 다음 tick 에서 이어 간다. 상태와 보고서는 `<프로젝트>/.loop-ai/` 에 있다(`state.db`, `STATUS.md`, `manager.lock`).
+
+## LLM 총괄
+
+`--coordinator llm` 이면 상태가 바뀔 때마다 LLM 을 한 번 부른다. goal, 작업 상태, 끝난 작업의 결과 일부, 최근 히스토리, 결정과 응답을 넘기고 JSON Schema 에 맞춘 계획을 받는다. 도구를 끄고 빈 임시 디렉터리에서 부르므로 총괄은 판단만 한다.
+
+| 제안 | 관리자가 검증하는 것 |
+| --- | --- |
+| `add_task` | ID 형식, 중복, 이미 있는 선행 작업, 빈 프롬프트, 한 번에 10개·전체 50개 상한 |
+| `dispatch` | 상태 버전, 실행 가능 여부, 선행 작업, 시도 상한, 동시 실행 상한. 선행 작업 결과를 옮겨 담은 프롬프트로 바꿔 실행할 수 있다 |
+| `ask_user` | ID 형식, 중복, 한 번에 질문 하나. 질문은 멈춤 보고서로 사용자에게 간다 |
+
+모든 작업이 done 이어도 총괄이 `goal_complete` 를 줘야 끝난다. 총괄 호출이 3번 연속 실패하거나, 목표 미완료라면서 다음 작업을 내지 않으면 멈춤으로 알린다. 호출 결과는 `coordinator_called` 로 히스토리에 남는다.
 
 ## 복구 계약
 
@@ -50,6 +68,8 @@ pnpm loop-ai status ./my-project                                 # 멈춘 곳·�
 | `src/lock.ts` | 관리자를 하나만 띄운다. 별도 파일에 SQLite `EXCLUSIVE` 잠금을 걸어, 프로세스가 죽으면 OS 가 푼다 |
 | `src/loop.ts` | 실행 루프. `Coordinator`·`Integrator` 인터페이스와 기본 구현 |
 | `src/cli.ts` | `loop-ai` 명령 (`init`·`add`·`run`·`status`·`answer`·`resolve`·`grant`) |
+| `src/llm.ts` | LLM 을 한 번 부르고 JSON Schema 에 맞춘 결과를 받는다 (Claude Code `--json-schema`, Codex `--output-schema`) |
+| `src/llm-coordinator.ts` | LLM 총괄. 프롬프트와 계획 스키마 |
 | `src/report.ts` | 상태 보고서. 멈춘 곳·작업·히스토리·다음에 할 일 |
 | `src/adapter.ts` | 어댑터 계약 (`launch`, `lookup`) |
 | `src/fake-adapter.ts` | 장애 주입용 가짜 어댑터 |
@@ -65,7 +85,7 @@ pnpm run typecheck
 pnpm test
 ```
 
-`pnpm test` 는 가짜 어댑터로 장애·알림·루프·CLI 시나리오 32개를 돌린다. 관리자 잠금과 SIGKILL 재시작은 실제 자식 프로세스로 확인한다.
+`pnpm test` 는 가짜 어댑터와 대본대로 응답하는 가짜 LLM 으로 장애·알림·루프·총괄·CLI 시나리오 42개를 돌린다. 관리자 잠금과 SIGKILL 재시작은 실제 자식 프로세스로 확인한다.
 
 실제 CLI 로 확인하려면 아래를 돌린다. 실제 모델을 부르므로 비용이 들고, `claude` 또는 `codex` 가 로그인된 상태여야 한다.
 
@@ -78,12 +98,13 @@ pnpm run verify:cli codex    # 시나리오 4개
 
 | 항목 | 상태 |
 | --- | --- |
-| 복구 계약·멈춤 알림·루프 (가짜 어댑터) | 32개 테스트 통과 |
+| 복구 계약·멈춤 알림·루프·총괄 (가짜 어댑터·가짜 LLM) | 42개 테스트 통과 |
 | 복구 계약·멈춤 알림 (실제 CLI) | Claude Code 5/5, Codex 4/4 통과 (각 1회 실행) |
 | 작업자 프로세스 강제 종료 | 재시도하지 않고 한 번 알린다. 실제 CLI 로 확인 |
+| 오래 끝나지 않는 작업자 | 살아 있어도 `--stall-minutes`(기본 15분)를 넘기면 알린다. 죽이거나 재시도하지 않는다 |
 | 실행 루프·CLI | `run` 이 tick 마다 재조회·검증·dispatch 를 한다. 실제 Claude Code·Codex 로 작업 2개(선행 관계)를 끝까지 돌렸다 |
-| 총괄 | 규칙 기반 기본 구현(실행 가능한 작업을 순서대로 제안)만 있다. LLM 총괄은 `Coordinator` 인터페이스로 붙일 자리만 있다 |
+| 총괄 | 규칙 기반(기본)과 LLM 총괄. 실제 Claude haiku 총괄로 goal 을 작업 2개로 나누고, 앞 작업 결과를 뒤 작업 프롬프트에 옮겨 끝까지 돌렸다 |
 | 통합 | 작업자의 작업 디렉터리에서 `--verify` 명령을 돌려 종료 코드로만 판정한다. 프로젝트 저장소와 병합하지 않으므로 "통합된 SHA 에서 검증"이 아니다 |
 | 작업 디렉터리 | 작업자는 빈 디렉터리에서 돈다. 프로젝트 worktree 를 넘겨주는 기능은 없다 |
-| 작업자 권한 | CLI 를 기본 권한으로 띄우므로 Claude Code 는 파일을 고치지 못할 수 있다. 권한 정책은 아직 정하지 않았다 |
+| 작업자 권한 | Claude 작업자는 `--permission-mode dontAsk` 로 띄운다. 권한이 필요한 도구 요청은 기다리지 않고 거절된다(기다리면 출력 없이 멈췄다). 그래서 지금 작업자는 파일을 고치지 못하고 결과를 텍스트로만 돌려준다. 권한 정책은 아직 정하지 않았다 |
 | 알림 | 동기 콜백·`STATUS.md`·표준 오류. 전달이 실패하면 다음 tick 에 다시 보낸다 |
