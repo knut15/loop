@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
@@ -99,6 +99,36 @@ await scenario('C. 어댑터 기록 직후 관리자 SIGKILL', 'after_record', a
   const ok = a!.status === 'launch_unknown' && runs === 0 && !spawned;
   return { scenario: '', ok, detail: `최종 ${a!.status}, 실제 실행 ${runs}회, 프로세스 흔적 ${spawned}` };
 });
+
+// E. 작업자 프로세스가 조용히 죽는다. 관리자는 재시도하지 않고 한 번 알려야 한다
+{
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), `loop-ai-${kind}-lost-`)));
+  const notes: string[] = [];
+  const adapter = CliAdapter.init(kind, path.join(dir, 'adapter.json'), MODEL[kind]);
+  const m = new Manager(path.join(dir, 'state.db'), adapter, path.join(dir, 'work'), (r) => notes.push(r));
+  try {
+    m.addTask('t1');
+    // 끝나기 전에 죽일 수 있도록 조금 오래 걸리는 프롬프트를 준다
+    const a = await m.dispatch('t1', 0, 'Count from 1 to 200, one number per line.');
+    await sleep(1500);
+    const line = execFileSync('ps', ['-axww', '-o', 'pid=,command='], { encoding: 'utf8' })
+      .split('\n').find((l) => l.includes(`loop-ai:${a.request_id}`) && l.includes('sh -c'));
+    if (!line) throw new Error('작업자 프로세스를 찾지 못했다(이미 끝났을 수 있다)');
+    process.kill(-Number(line.trim().split(/\s+/)[0]), 'SIGKILL'); // 셸 래퍼와 CLI 를 프로세스 그룹째 죽인다
+    await sleep(1500);
+    await m.recover();
+    await m.recover();
+    const [after] = m.attempts('t1');
+    const ok = notes.length === 1 && /종료 코드 없이 사라졌거나/.test(notes[0]!) && /resolveUnknown/.test(notes[0]!)
+      && after!.status === 'launched' && !existsSync(path.join(a.workdir, 'exit_code')) && countRuns(a.request_id) <= 1;
+    results.push({ scenario: 'E. 작업자 프로세스 SIGKILL', ok, detail: `알림 ${notes.length}회, 시도 ${after!.status}/${after!.last_lookup}, 다시 시작 없음 (dir: ${dir})` });
+    if (notes[0]) console.log(notes[0]);
+  } catch (e) {
+    results.push({ scenario: 'E. 작업자 프로세스 SIGKILL', ok: false, detail: String(e) });
+  } finally {
+    m.close();
+  }
+}
 
 // D. Claude 는 같은 session id 로 다시 실행하면 CLI 가 스스로 거절하는지 확인한다
 if (kind === 'claude') {

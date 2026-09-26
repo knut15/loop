@@ -15,16 +15,19 @@ function setup() {
   const dbPath = path.join(dir, 'state.db');
   const storePath = path.join(dir, 'fake-adapter.json');
   let adapter = FakeAdapter.init(storePath);
-  let m = new Manager(dbPath, adapter, path.join(dir, 'work'));
+  const notes: string[] = [];
+  const notify = (r: string) => { notes.push(r); };
+  let m = new Manager(dbPath, adapter, path.join(dir, 'work'), notify);
   return {
     dir,
     storePath,
+    notes,
     get adapter() { return adapter; },
     get m() { return m; },
     restart() {
       m.close();
       adapter = new FakeAdapter(storePath);
-      m = new Manager(dbPath, adapter, path.join(dir, 'work'));
+      m = new Manager(dbPath, adapter, path.join(dir, 'work'), notify);
       return m;
     },
   };
@@ -222,4 +225,71 @@ test('11. 관리자 프로세스를 실제로 SIGKILL 한 뒤 새 프로세스�
     assert.equal(adapter.launchCount(attempts[0]!.request_id), 1, crashAt);
     m.close();
   }
+});
+
+test('12. 작업자가 조용히 사라지면 한 번 알리고, 보고서에 히스토리와 다음 할 일을 담는다', async () => {
+  const s = setup();
+  s.m.addTask('t1');
+  s.m.addTask('t2');
+  const a = await s.m.dispatch('t1', 0, 'build');
+  const m = s.restart();
+  s.adapter.unreachable.add(a.request_id); // 종료 코드도 프로세스도 찾을 수 없다
+  await m.recover();
+  assert.equal(s.notes.length, 1);
+  const r = s.notes[0]!;
+  assert.match(r, /## 멈춘 곳 \(1\)/);
+  assert.match(r, /종료 코드 없이 사라졌거나/);
+  assert.match(r, new RegExp(`resolveUnknown\\('${a.id}'`));
+  assert.match(r, /실행 가능한 작업을 dispatch 한다: t2/);
+  assert.deepEqual(m.history().map((h) => h.kind), ['task_added', 'task_added', 'intent', 'launched', 'lost', 'alerted']);
+
+  // 같은 멈춤은 루프가 돌 때마다 다시 알리지 않는다. 재시도도 하지 않는다
+  await m.recover();
+  assert.equal(s.notes.length, 1);
+  assert.equal(s.adapter.totalLaunches(), 1);
+
+  // 사람이 확인하고 판정하면 멈춤이 풀린다
+  m.resolveUnknown(a.id, 'failed');
+  assert.equal(m.task('t1').state, 'ready');
+  assert.deepEqual(m.attention(), []);
+});
+
+test('13. 시작 여부를 알 수 없는 시도도 알린다', async () => {
+  const s = setup();
+  s.m.addTask('t1');
+  await assert.rejects(s.m.dispatch('t1', 0, 'build', 'after_launch'), SimulatedCrash);
+  const m = s.restart();
+  s.adapter.canLookup = false;
+  await m.recover();
+  assert.equal(s.notes.length, 1);
+  assert.match(s.notes[0]!, /시작됐는지 알 수 없다/);
+});
+
+test('14. 사용자 결정을 요청하면 무엇을 입력해야 하는지 알린다', () => {
+  const s = setup();
+  s.m.openDecision('d1');
+  s.m.addTask('t1', 'd1');
+  assert.equal(s.notes.length, 1);
+  assert.match(s.notes[0]!, /answerDecision\('d1', 1, '<응답>'\)/);
+});
+
+test('15. 알림 수단이 없어도 표준 오류로 보고서를 남긴다', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'loop-ai-'));
+  const m = new Manager(path.join(dir, 'state.db'), FakeAdapter.init(path.join(dir, 'fake.json')), path.join(dir, 'work'));
+  const written: string[] = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    m.openDecision('d1');
+  } finally {
+    process.stderr.write = orig;
+  }
+  assert.match(written.join(''), /# loop-ai 상태 보고/);
+});
+
+test('16. 멈추지 않은 시도는 사람이 판정할 수 없다', async () => {
+  const s = setup();
+  s.m.addTask('t1');
+  const a = await s.m.dispatch('t1', 0, 'build');
+  assert.throws(() => s.m.resolveUnknown(a.id, 'succeeded'), Rejected);
 });
