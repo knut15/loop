@@ -1,0 +1,171 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "loop-ai 오케스트레이터 실행 루프",
+    "quality_profile": "showcase",
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "lanes": [
+    {
+      "id": "manager",
+      "label": "실행 관리자 (loop-ai)"
+    },
+    {
+      "id": "outside",
+      "label": "사용자·에이전트"
+    }
+  ],
+  "mainPath": [
+    "goal",
+    "inbox",
+    "coordinator",
+    "validate",
+    "dispatch",
+    "worker",
+    "integrate"
+  ],
+  "nodes": [
+    {
+      "id": "goal",
+      "lane": "outside",
+      "col": 0,
+      "type": "external",
+      "label": "사용자 Goal",
+      "sublabel": "요청과 결정 응답"
+    },
+    {
+      "id": "gate",
+      "lane": "outside",
+      "col": 3,
+      "type": "security",
+      "label": "사용자 결정",
+      "sublabel": "decision ID + version"
+    },
+    {
+      "id": "store",
+      "lane": "manager",
+      "col": 0,
+      "type": "database",
+      "label": "SQLite",
+      "sublabel": "상태·이벤트·outbox"
+    },
+    {
+      "id": "inbox",
+      "lane": "manager",
+      "col": 1,
+      "type": "backend",
+      "label": "이벤트 수신",
+      "sublabel": "중복 키는 한 번만"
+    },
+    {
+      "id": "validate",
+      "lane": "manager",
+      "col": 3,
+      "type": "security",
+      "label": "제안 검증",
+      "sublabel": "상태 버전·전이·권한"
+    },
+    {
+      "id": "dispatch",
+      "lane": "manager",
+      "col": 4,
+      "type": "backend",
+      "label": "실행 의도 저장",
+      "sublabel": "attempt·request_id 먼저"
+    },
+    {
+      "id": "integrate",
+      "lane": "manager",
+      "col": 5,
+      "type": "backend",
+      "label": "통합·인수 검증",
+      "sublabel": "통합 SHA에서 테스트"
+    },
+    {
+      "id": "coordinator",
+      "lane": "outside",
+      "col": 2,
+      "type": "backend",
+      "label": "총괄",
+      "sublabel": "이벤트 묶음 → 제안"
+    },
+    {
+      "id": "worker",
+      "lane": "outside",
+      "col": 4,
+      "type": "messagebus",
+      "label": "작업자",
+      "sublabel": "Claude Code · Codex",
+      "tag": "detached"
+    }
+  ],
+  "edges": [
+    {
+      "id": "goal-inbox",
+      "from": "goal",
+      "to": "inbox",
+      "label": "요청"
+    },
+    {
+      "id": "inbox-store",
+      "from": "inbox",
+      "to": "store",
+      "label": "기록",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "inbox-coord",
+      "from": "inbox",
+      "to": "coordinator",
+      "label": "스냅샷",
+      "variant": "emphasis"
+    },
+    {
+      "id": "coord-validate",
+      "from": "coordinator",
+      "to": "validate",
+      "label": "버전 붙은 제안"
+    },
+    {
+      "id": "validate-gate",
+      "from": "validate",
+      "to": "gate",
+      "label": "사용자 결정 필요",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "id": "validate-dispatch",
+      "from": "validate",
+      "to": "dispatch",
+      "variant": "emphasis"
+    },
+    {
+      "id": "dispatch-worker",
+      "from": "dispatch",
+      "to": "worker",
+      "label": "launch"
+    },
+    {
+      "id": "worker-integrate",
+      "from": "worker",
+      "to": "integrate",
+      "label": "succeeded"
+    },
+    {
+      "id": "integrate-inbox",
+      "from": "integrate",
+      "to": "inbox",
+      "label": "다음 이벤트",
+      "variant": "emphasis",
+      "role": "return",
+      "fromSide": "top",
+      "toSide": "top",
+      "route": "up-channel"
+    }
+  ]
+}
