@@ -8,10 +8,14 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test --disable-warning=ExperimentalWarning test/*.test.ts",
-    "verify:cli": "node --disable-warning=ExperimentalWarning scripts/verify-real-cli.ts"
+    "verify:cli": "node --disable-warning=ExperimentalWarning scripts/verify-real-cli.ts",
+    "loop-ai": "node --disable-warning=ExperimentalWarning src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^24.13.6",
     "typescript": "^7.0.2"
+  },
+  "bin": {
+    "loop-ai": "./src/cli.ts"
   }
 }

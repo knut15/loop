@@ -6,11 +6,12 @@ export type HistoryEntry = { at: string; task_id: string | null; attempt_id: str
 type ReportInput = {
   at: string;
   tasks: { id: string; state: string; version: number }[];
+  runnable: string[];
   attention: Attention[];
   history: HistoryEntry[];
 };
 
-export function renderReport({ at, tasks, attention, history }: ReportInput): string {
+export function renderReport({ at, tasks, runnable, attention, history }: ReportInput): string {
   const lines: string[] = [`# loop-ai 상태 보고 (${at})`, ''];
 
   lines.push(`## 멈춘 곳 (${attention.length})`, '');
@@ -30,7 +31,7 @@ export function renderReport({ at, tasks, attention, history }: ReportInput): st
 
   lines.push('## 다음에 할 일', '');
   const next = attention.map((a) => a.next);
-  const ready = tasks.filter((t) => t.state === 'ready').map((t) => t.id);
+  const ready = runnable;
   const integrating = tasks.filter((t) => t.state === 'integrating').map((t) => t.id);
   if (ready.length) next.push(`실행 가능한 작업을 dispatch 한다: ${ready.join(', ')}`);
   if (integrating.length) next.push(`통합·인수 검증을 돌린다: ${integrating.join(', ')}`);

@@ -15,7 +15,11 @@ export class SimulatedCrash extends Error {}
 export type TaskState = 'ready' | 'blocked' | 'running' | 'integrating' | 'done';
 export type AttemptStatus = 'intent' | 'launched' | 'launch_unknown' | 'succeeded' | 'failed';
 
-export type Task = { id: string; state: TaskState; version: number; blocked_by: string | null; commit_sha: string | null };
+export type Task = {
+  id: string; state: TaskState; version: number; blocked_by: string | null; commit_sha: string | null;
+  prompt: string; depends_on: string; max_attempts: number;
+};
+export type TaskOptions = { prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number };
 export type Attempt = {
   id: string; task_id: string; request_id: string; workdir: string; prompt: string; status: AttemptStatus;
   last_lookup: string | null;
@@ -26,7 +30,8 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
-  blocked_by TEXT, commit_sha TEXT
+  blocked_by TEXT, commit_sha TEXT,
+  prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -57,9 +62,33 @@ export class Manager {
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.db.exec(SCHEMA);
+    this.migrate();
     this.adapter = adapter;
     this.workRoot = workRoot;
     this.notify = notify;
+  }
+
+  // 이전 버전이 만든 DB 에 없는 열을 채운다. CREATE TABLE IF NOT EXISTS 는 기존 표에 열을 더하지 않는다
+  private migrate(): void {
+    const has = (table: string, col: string) =>
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === col);
+    const add: [string, string, string][] = [
+      ['tasks', 'prompt', `TEXT NOT NULL DEFAULT ''`],
+      ['tasks', 'depends_on', `TEXT NOT NULL DEFAULT ''`],
+      ['tasks', 'max_attempts', 'INTEGER NOT NULL DEFAULT 3'],
+      ['attempts', 'last_lookup', 'TEXT'],
+    ];
+    for (const [table, col, def] of add) {
+      if (!has(table, col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+    }
+  }
+
+  // dispatch·recover 를 한 관리자 안에서 한 줄로 세운다. 겹치면 같은 시도를 두 번 띄울 수 있다
+  private queue: Promise<unknown> = Promise.resolve();
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.catch(() => {});
+    return run;
   }
 
   private log(taskId: string | null, attemptId: string | null, kind: string, detail: string): void {
@@ -98,10 +127,40 @@ export class Manager {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(v));
   }
 
-  addTask(id: string, blockedBy?: string): void {
-    this.db.prepare('INSERT INTO tasks (id, state, blocked_by) VALUES (?, ?, ?)')
-      .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null);
-    this.log(id, null, 'task_added', blockedBy ? `결정 ${blockedBy} 대기로 추가` : '실행 가능으로 추가');
+  addTask(id: string, opts: TaskOptions = {}): void {
+    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3 } = opts;
+    this.db.prepare('INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts);
+    const why = [blockedBy && `결정 ${blockedBy} 대기`, dependsOn.length && `선행 ${dependsOn.join(', ')}`].filter(Boolean).join(', ');
+    this.log(id, null, 'task_added', why ? `추가 (${why})` : '실행 가능으로 추가');
+  }
+
+  tasks(): Task[] {
+    return this.db.prepare('SELECT * FROM tasks ORDER BY rowid').all() as Task[];
+  }
+
+  private attemptCount(taskId: string): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?').get(taskId) as { n: number }).n;
+  }
+
+  private depsDone(t: Task): boolean {
+    const deps = t.depends_on ? t.depends_on.split(',') : [];
+    return deps.every((d) => this.task(d).state === 'done');
+  }
+
+  // 권한 있는 시도(intent·launched·launch_unknown) 수. 동시 실행 상한에 쓴다
+  liveCount(): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM attempts WHERE status IN ('intent', 'launched', 'launch_unknown')`).get() as { n: number }).n;
+  }
+
+  lastSucceeded(taskId: string): Attempt | undefined {
+    return this.db.prepare(`SELECT * FROM attempts WHERE task_id = ? AND status = 'succeeded' ORDER BY rowid DESC LIMIT 1`).get(taskId) as Attempt | undefined;
+  }
+
+  // 시도 횟수 상한에 닿은 작업에 기회를 더 준다. 사람이 원인을 확인한 뒤 부른다
+  grantAttempts(taskId: string, n: number): void {
+    this.db.prepare('UPDATE tasks SET max_attempts = max_attempts + ? WHERE id = ?').run(n, taskId);
+    this.log(taskId, null, 'attempts_granted', `시도 ${n}회 추가`);
   }
 
   task(id: string): Task {
@@ -114,8 +173,11 @@ export class Manager {
     return this.db.prepare('SELECT * FROM attempts WHERE task_id = ? ORDER BY rowid').all(taskId) as Attempt[];
   }
 
+  // 지금 dispatch 할 수 있는 작업: ready 이고, 선행 작업이 끝났고, 시도 횟수가 남았다
   runnable(): string[] {
-    return (this.db.prepare(`SELECT id FROM tasks WHERE state = 'ready' ORDER BY rowid`).all() as { id: string }[]).map((r) => r.id);
+    return this.tasks()
+      .filter((t) => t.state === 'ready' && this.depsDone(t) && this.attemptCount(t.id) < t.max_attempts)
+      .map((t) => t.id);
   }
 
   private bump(taskId: string, state: TaskState): void {
@@ -123,12 +185,18 @@ export class Manager {
   }
 
   // 총괄의 "이 작업을 실행하라" 제안. expectedVersion 은 총괄이 보고 판단한 상태 버전이다.
-  async dispatch(taskId: string, expectedVersion: number, prompt: string, crashAt?: 'after_intent' | 'after_launch'): Promise<Attempt> {
+  dispatch(taskId: string, expectedVersion: number, prompt: string, crashAt?: 'after_intent' | 'after_launch'): Promise<Attempt> {
+    return this.serial(() => this.dispatchNow(taskId, expectedVersion, prompt, crashAt));
+  }
+
+  private async dispatchNow(taskId: string, expectedVersion: number, prompt: string, crashAt?: 'after_intent' | 'after_launch'): Promise<Attempt> {
     // 실행 전에 attempt ID·request_id·작업 디렉터리·시작 의도를 먼저 저장한다
     const attempt = this.tx(() => {
       const t = this.task(taskId);
       if (t.version !== expectedVersion) throw new Rejected(`상태 버전이 다르다: 현재 ${t.version}, 제안 ${expectedVersion}`);
       if (t.state !== 'ready') throw new Rejected(`실행 가능 상태가 아니다: ${t.state}`);
+      if (!this.depsDone(t)) throw new Rejected(`선행 작업이 끝나지 않았다: ${t.depends_on}`);
+      if (this.attemptCount(taskId) >= t.max_attempts) throw new Rejected(`시도 횟수 상한 ${t.max_attempts}회에 닿았다`);
       const id = randomUUID();
       const a: Attempt = { id, task_id: taskId, request_id: `req-${id}`, workdir: path.join(this.workRoot, id), prompt, status: 'intent', last_lookup: null };
       this.db.prepare('INSERT INTO attempts (id, task_id, request_id, workdir, prompt, status) VALUES (?, ?, ?, ?, ?, ?)')
@@ -146,29 +214,40 @@ export class Manager {
   }
 
   // 재시작 뒤 끝나지 않은 시도를 request_id 로 다시 조회해 이어 간다
-  async recover(): Promise<void> {
-    const live = this.db.prepare(`SELECT * FROM attempts WHERE status IN ('intent', 'launched') ORDER BY rowid`).all() as Attempt[];
+  // 재시작 뒤 끝나지 않은 시도를 request_id 로 다시 조회해 이어 간다
+  recover(): Promise<void> {
+    return this.serial(() => this.recoverNow());
+  }
+
+  private async recoverNow(): Promise<void> {
+    // launch_unknown 도 계속 조회한다. 다시 시작하지는 않지만, 확실한 근거가 나오면 반영한다
+    const live = this.db.prepare(`SELECT * FROM attempts WHERE status IN ('intent', 'launched', 'launch_unknown') ORDER BY rowid`).all() as Attempt[];
     for (const a of live) {
       const r = await this.adapter.lookup(a.request_id);
+      // 조회를 기다리는 사이 다른 쪽이 이 시도를 바꿨다면 읽은 값은 낡았다. 건드리지 않는다
+      const now = this.db.prepare('SELECT status FROM attempts WHERE id = ?').get(a.id) as { status: AttemptStatus };
+      if (now.status !== a.status) continue;
+
       if (r === 'running') {
-        if (a.status === 'intent') this.log(a.task_id, a.id, 'recovered', '재조회: 실행 중');
-        this.setAttemptStatus(a.id, 'launched', r);
+        if (a.status !== 'launched') this.log(a.task_id, a.id, 'recovered', `재조회: 실행 중 (${a.status} → launched)`);
+        this.moveAttempt(a, 'launched', r);
       } else if (r === 'succeeded' || r === 'failed') {
         this.onResult(`lookup:${a.id}`, a.id, r);
       } else if (r === 'not_found' && a.status === 'intent') {
         // 시작된 적이 없다고 어댑터가 확인해 줬으므로 같은 request_id 로 시작한다
         await this.adapter.launch({ requestId: a.request_id, workdir: a.workdir, prompt: a.prompt });
-        this.setAttemptStatus(a.id, 'launched', r);
+        this.moveAttempt(a, 'launched', r);
         this.log(a.task_id, a.id, 'launched', '재조회: 시작된 적 없음 → 같은 request_id 로 시작');
-      } else if (a.status === 'intent' || r === 'not_found') {
+      } else if (a.status === 'intent' || (a.status === 'launched' && r === 'not_found')) {
         // 시작됐는지 알 수 없다. 다시 시작하지 않고 조사 대상으로 남긴다
-        this.setAttemptStatus(a.id, 'launch_unknown', r);
+        this.moveAttempt(a, 'launch_unknown', r);
         this.log(a.task_id, a.id, 'launch_unknown', `재조회 결과 ${r}: 시작 여부를 알 수 없어 다시 시작하지 않음`);
-      } else {
+      } else if (a.status === 'launched') {
         // launched + unknown: 재시도하지 않고 기다리되, 처음 발견한 순간 기록하고 알린다
         if (a.last_lookup !== 'unknown') this.log(a.task_id, a.id, 'lost', '종료 코드도 실행 중인 프로세스도 찾지 못함');
-        this.setAttemptStatus(a.id, 'launched', r);
+        this.moveAttempt(a, 'launched', r);
       }
+      // launch_unknown + not_found/unknown: 그대로 둔다
     }
     this.alertIfNeeded();
   }
@@ -187,6 +266,16 @@ export class Manager {
         next: `작업 디렉터리 ${a.workdir} 와 CLI 실행 기록(request_id ${a.request_id})을 확인해 끝났는지 판정한 뒤 resolveUnknown('${a.id}', 'succeeded' | 'failed') 를 입력한다`,
       });
     }
+    for (const t of this.tasks()) {
+      const n = this.attemptCount(t.id);
+      if (t.state !== 'ready' || n < t.max_attempts) continue;
+      items.push({
+        key: `exhausted:${t.id}:${n}`,
+        taskId: t.id,
+        reason: `${n}번 시도했지만 끝나지 않아 더 시도하지 않는다`,
+        next: `시도 기록(history, 작업 디렉터리)을 보고 원인을 고친 뒤 grantAttempts('${t.id}', 1) 로 다시 허용한다`,
+      });
+    }
     const open = this.db.prepare(`SELECT id, spec_version FROM decisions WHERE status = 'open' ORDER BY rowid`).all() as { id: string; spec_version: number }[];
     for (const d of open) {
       const blocked = (this.db.prepare(`SELECT id FROM tasks WHERE blocked_by = ?`).all(d.id) as { id: string }[]).map((t) => t.id);
@@ -201,22 +290,33 @@ export class Manager {
   }
 
   report(): string {
-    const tasks = this.db.prepare('SELECT * FROM tasks ORDER BY rowid').all() as Task[];
-    return renderReport({ at: new Date().toISOString(), tasks, attention: this.attention(), history: this.history() });
+    return renderReport({ at: new Date().toISOString(), tasks: this.tasks(), runnable: this.runnable(), attention: this.attention(), history: this.history() });
   }
 
-  // 새로 멈춘 곳이 있으면 한 번 알린다. 알렸으면 true
+  // 새로 멈춘 곳이 있으면 알린다. 실제로 전달된 뒤에만 보낸 것으로 기록하고, 실패하면 다음에 다시 보낸다.
+  // 전달했으면 true
   alertIfNeeded(): boolean {
     const fresh = this.attention().filter((a) => !this.db.prepare('SELECT 1 FROM alerts WHERE key = ?').get(a.key));
     if (fresh.length === 0) return false;
+    // notify 가 없으면 표준 오류로라도 남긴다. 조용히 넘어가지 않는다
+    const send = this.notify ?? ((r: string) => { process.stderr.write(r + '\n'); });
+    try {
+      send(this.report());
+    } catch (e) {
+      this.log(null, null, 'alert_failed', `알림 전달 실패, 다음에 다시 보낸다: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
     const at = new Date().toISOString();
     for (const a of fresh) {
       this.db.prepare('INSERT INTO alerts (key, at) VALUES (?, ?)').run(a.key, at);
       this.log(a.taskId, null, 'alerted', `${a.reason} → 사용자에게 알림`);
     }
-    // notify 가 없으면 표준 오류로라도 남긴다. 조용히 넘어가지 않는다
-    (this.notify ?? ((r: string) => process.stderr.write(r + '\n')))(this.report());
     return true;
+  }
+
+  // 총괄의 제안이 검증에서 거절된 것을 남긴다
+  noteRejected(taskId: string, reason: string): void {
+    this.log(taskId, null, 'proposal_rejected', reason);
   }
 
   // 멈춘 시도에 대한 사람의 판정. 확인한 결과를 이벤트로 반영한다
@@ -230,8 +330,10 @@ export class Manager {
     this.onResult(`human:${a.id}`, a.id, verdict);
   }
 
-  private setAttemptStatus(attemptId: string, status: AttemptStatus, lastLookup: string): void {
-    this.db.prepare('UPDATE attempts SET status = ?, last_lookup = ? WHERE id = ?').run(status, lastLookup, attemptId);
+  // 읽었을 때의 상태가 그대로일 때만 바꾼다. 그 사이 다른 쪽이 바꿨으면 아무것도 하지 않는다
+  private moveAttempt(a: Attempt, status: AttemptStatus, lastLookup: string): boolean {
+    return this.db.prepare('UPDATE attempts SET status = ?, last_lookup = ? WHERE id = ? AND status = ?')
+      .run(status, lastLookup, a.id, a.status).changes === 1;
   }
 
   // 완료·실패 이벤트. 같은 key 로 두 번 와도 한 번만 반영한다
@@ -248,6 +350,10 @@ export class Manager {
       this.log(task_id, attemptId, result, result === 'succeeded' ? '작업자 실행 종료 → 통합 대기' : '실패 확인 → 다시 실행 가능');
       return true;
     });
+  }
+
+  hasDecision(id: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM decisions WHERE id = ?').get(id);
   }
 
   openDecision(id: string): void {
@@ -278,10 +384,10 @@ export class Manager {
       if (t.state !== 'integrating') throw new Rejected(`통합 단계가 아니다: ${t.state}`);
       if (testsPassed) {
         this.db.prepare(`UPDATE tasks SET state = 'done', commit_sha = ?, version = version + 1 WHERE id = ?`).run(commitSha, taskId);
-        this.log(taskId, null, 'done', `통합 검증 통과 (${commitSha})`);
+        this.log(taskId, null, 'done', `검증 통과 (${commitSha})`);
       } else {
         this.bump(taskId, 'ready');
-        this.log(taskId, null, 'rework', `통합 검증 실패 (${commitSha}) → 다시 실행 가능`);
+        this.log(taskId, null, 'rework', `검증 실패 (${commitSha}) → 다시 실행 가능`);
       }
     });
   }

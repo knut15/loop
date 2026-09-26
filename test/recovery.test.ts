@@ -76,7 +76,7 @@ test('3. 작업자 생존을 확인할 수 없으면 새 시도를 내지 않고
 test('4. 사용자 결정을 기다리는 동안 관련 없는 작업은 끝까지 진행된다', async () => {
   const s = setup();
   s.m.openDecision('d1');
-  s.m.addTask('t1', 'd1');
+  s.m.addTask('t1', { blockedBy: 'd1' });
   s.m.addTask('t2');
   assert.deepEqual(s.m.runnable(), ['t2']);
   const a = await s.m.dispatch('t2', 0, 'build');
@@ -159,7 +159,7 @@ test('7. 실행 직후 죽었는데 어댑터로 조회할 수 없으면 launch_
 test('8. 중복 사용자 응답과 오래된 스펙에 대한 응답은 거절한다', () => {
   const s = setup();
   s.m.openDecision('d1');
-  s.m.addTask('t1', 'd1');
+  s.m.addTask('t1', { blockedBy: 'd1' });
   s.m.answerDecision('d1', 1, 'PostgreSQL');
   assert.equal(s.m.task('t1').state, 'ready');
   assert.throws(() => s.m.answerDecision('d1', 1, 'MySQL'), Rejected);
@@ -268,7 +268,7 @@ test('13. 시작 여부를 알 수 없는 시도도 알린다', async () => {
 test('14. 사용자 결정을 요청하면 무엇을 입력해야 하는지 알린다', () => {
   const s = setup();
   s.m.openDecision('d1');
-  s.m.addTask('t1', 'd1');
+  s.m.addTask('t1', { blockedBy: 'd1' });
   assert.equal(s.notes.length, 1);
   assert.match(s.notes[0]!, /answerDecision\('d1', 1, '<응답>'\)/);
 });

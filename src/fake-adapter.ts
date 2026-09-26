@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import type { Adapter, LaunchRequest, LookupResult } from './adapter.ts';
 
 type Store = {
@@ -15,6 +15,8 @@ export class FakeAdapter implements Adapter {
   readonly unreachable = new Set<string>();
   // true 면 실행 기록을 남긴 뒤 응답 전에 throw 한다
   throwAfterRecord = false;
+  // 설정하면 launch 하자마자 그 결과로 끝난 것으로 기록한다 (루프 테스트용)
+  autoResult: 'succeeded' | 'failed' | undefined;
 
   // 생성자는 기존 저장소를 열기만 한다. 여기서 빈 저장소를 만들면, 기록을 잃은 뒤 새로 띄운
   // 인스턴스가 이전 실행을 not_found 로 잘못 판정해 중복 시작하게 된다.
@@ -44,8 +46,9 @@ export class FakeAdapter implements Adapter {
   async launch(req: LaunchRequest): Promise<void> {
     const s = this.load();
     if (!s) throw new Error(`어댑터 저장소를 읽을 수 없다: ${this.storePath}`);
+    mkdirSync(req.workdir, { recursive: true });
     s.launchCount[req.requestId] = (s.launchCount[req.requestId] ?? 0) + 1;
-    s.runs[req.requestId] = 'running';
+    s.runs[req.requestId] = this.autoResult ?? 'running';
     this.save(s);
     if (this.throwAfterRecord) throw new Error('실행은 기록됐지만 응답 전에 연결이 끊겼다');
   }
