@@ -17,6 +17,10 @@ type Store = { [requestId: string]: Record };
 // 셸 래퍼의 $0 에 넣는 표지. ps 로 살아 있는 실행을 찾을 때 쓴다
 const marker = (requestId: string) => `loop-ai:${requestId}`;
 
+// 어댑터 기록(작업자 출력·오류·종료 코드)을 두는 곳. 작업 디렉터리 안에 두면 git worktree 방식에서
+// 작업 변경으로 함께 커밋돼 프로젝트에 병합된다 (실제로 그랬다). 그래서 작업 디렉터리 옆에 따로 둔다
+export const runDir = (workdir: string) => `${workdir}.run`;
+
 // request_id 는 'req-<uuid>' 형식이다. Claude 에는 uuid 부분을 session id 로 넘긴다
 export const claudeSessionId = (requestId: string) => requestId.replace(/^req-/, '');
 
@@ -69,9 +73,11 @@ export class CliAdapter implements Adapter {
 
     const argv = command(this.kind, req.requestId, req.prompt, this.model, this.access);
     // 종료 코드는 임시 파일에 쓴 뒤 mv 로 바꿔 넣어, 반쯤 쓴 파일을 읽지 않게 한다
-    const script = '"$@" > out.jsonl 2> err.txt < /dev/null; echo $? > exit_code.tmp && mv exit_code.tmp exit_code';
+    const script = '"$@" > "$LOOPAI_RUN/out.jsonl" 2> "$LOOPAI_RUN/err.txt" < /dev/null; '
+      + 'echo $? > "$LOOPAI_RUN/exit_code.tmp" && mv "$LOOPAI_RUN/exit_code.tmp" "$LOOPAI_RUN/exit_code"';
+    mkdirSync(runDir(req.workdir), { recursive: true });
     const child = spawn('sh', ['-c', script, marker(req.requestId), ...argv], {
-      cwd: req.workdir, detached: true, stdio: 'ignore',
+      cwd: req.workdir, detached: true, stdio: 'ignore', env: { ...process.env, LOOPAI_RUN: runDir(req.workdir) },
     });
     child.unref();
   }
@@ -81,7 +87,7 @@ export class CliAdapter implements Adapter {
     if (!store) return 'unknown';
     const rec = store[requestId];
     if (!rec) return 'not_found';
-    const exitFile = path.join(rec.workdir, 'exit_code');
+    const exitFile = path.join(runDir(rec.workdir), 'exit_code');
     if (existsSync(exitFile)) return readFileSync(exitFile, 'utf8').trim() === '0' ? 'succeeded' : 'failed';
     if (isAlive(requestId)) return 'running';
     // 기록은 있는데 종료 코드도 프로세스도 없다: 띄우기 전에 죽었거나 래퍼가 강제 종료됐다
@@ -96,7 +102,7 @@ export function isAlive(requestId: string): boolean {
 
 // 끝난 작업자의 최종 응답을 읽는다. 총괄이 다음 작업 프롬프트에 결과를 옮겨 담을 때 쓴다
 export function readOutput(kind: CliKind, workdir: string, limit = 1000): string | undefined {
-  const file = path.join(workdir, 'out.jsonl');
+  const file = path.join(runDir(workdir), 'out.jsonl');
   if (!existsSync(file)) return undefined;
   const raw = readFileSync(file, 'utf8');
   try {
@@ -113,16 +119,67 @@ export function readOutput(kind: CliKind, workdir: string, limit = 1000): string
   }
 }
 
-// 작업자가 권한 밖이라 거절당한 도구 요청. Claude 만 결과에 permission_denials 로 남긴다.
-// Codex 샌드박스 거절은 명령 실패로만 보여서 여기서는 잡지 못한다
+// 샌드박스 거절을 알려 주는 문구. Codex 는 거절을 따로 표시하지 않고 명령 출력이나 응답 문장에만 남긴다
+const SANDBOX_DENIAL = /operation not permitted|read-only file system|sandbox (denied|blocked)|blocked by (the )?sandbox/i;
+
+// 작업자가 권한 밖이라 거절당한 요청.
+// Claude: 결과의 permission_denials. 샌드박스 안 Bash 거절은 여기에 남지 않아 응답 문장에서도 찾는다.
+// Codex: 명령 항목(command_execution)의 출력과 응답 문장에서 거절 문구를 찾는다. Codex 는 명령 항목을
+//   늘 남기지는 않아서, 응답 문장에만 거절이 나타나는 경우가 실제로 있었다. 응답 문장은 모델이 쓴 글이라 덜 확실하다
 export function readDenials(kind: CliKind, workdir: string): string[] {
-  if (kind !== 'claude') return [];
-  const file = path.join(workdir, 'out.jsonl');
+  const file = path.join(runDir(workdir), 'out.jsonl');
   if (!existsSync(file)) return [];
+  if (kind === 'codex') {
+    const out: string[] = [];
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const ev = JSON.parse(line) as { type?: string; item?: { type?: string; text?: string; command?: string; aggregated_output?: string } };
+        const it = ev.item;
+        if (ev.type !== 'item.completed' || !it) continue;
+        if (it.type === 'command_execution' && SANDBOX_DENIAL.test(it.aggregated_output ?? '')) {
+          out.push(`Shell(${(it.command ?? '').slice(0, 120)})`);
+        } else if (it.type === 'agent_message' && SANDBOX_DENIAL.test(it.text ?? '')) {
+          const m = SANDBOX_DENIAL.exec(it.text ?? '')!;
+          out.push(`응답에 거절 언급: …${(it.text ?? '').slice(Math.max(0, m.index - 60), m.index + 40)}…`);
+        }
+      } catch { /* 한 줄이 깨져도 나머지는 읽는다 */ }
+    }
+    return out;
+  }
   try {
-    const r = JSON.parse(readFileSync(file, 'utf8')) as { permission_denials?: { tool_name: string; tool_input?: unknown }[] };
-    return (r.permission_denials ?? []).map((d) => `${d.tool_name}(${JSON.stringify(d.tool_input ?? {}).slice(0, 120)})`);
+    const r = JSON.parse(readFileSync(file, 'utf8')) as { permission_denials?: { tool_name: string; tool_input?: unknown }[]; result?: string };
+    const out = (r.permission_denials ?? []).map((d) => `${d.tool_name}(${JSON.stringify(d.tool_input ?? {}).slice(0, 120)})`);
+    const m = SANDBOX_DENIAL.exec(r.result ?? '');
+    if (m) out.push(`응답에 거절 언급: …${(r.result ?? '').slice(Math.max(0, m.index - 60), m.index + 40)}…`);
+    return out;
   } catch {
     return [];
+  }
+}
+
+// 끝난 작업자의 사용량. Claude 는 total_cost_usd 를 주고, Codex 는 토큰 수만 준다 (비용은 모름)
+export function readUsage(kind: CliKind, workdir: string): { costUsd: number | null; inputTokens?: number; outputTokens?: number } | undefined {
+  const file = path.join(runDir(workdir), 'out.jsonl');
+  if (!existsSync(file)) return undefined;
+  try {
+    const raw = readFileSync(file, 'utf8');
+    if (kind === 'claude') {
+      const r = JSON.parse(raw) as { total_cost_usd?: number; usage?: { input_tokens?: number; output_tokens?: number } };
+      return { costUsd: r.total_cost_usd ?? null, inputTokens: r.usage?.input_tokens, outputTokens: r.usage?.output_tokens };
+    }
+    let input = 0;
+    let output = 0;
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      const ev = JSON.parse(line) as { type?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+      if (ev.type === 'turn.completed') {
+        input += ev.usage?.input_tokens ?? 0;
+        output += ev.usage?.output_tokens ?? 0;
+      }
+    }
+    return { costUsd: null, inputTokens: input, outputTokens: output };
+  } catch {
+    return undefined;
   }
 }

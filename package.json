@@ -9,13 +9,22 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test --disable-warning=ExperimentalWarning test/*.test.ts",
     "verify:cli": "node --disable-warning=ExperimentalWarning scripts/verify-real-cli.ts",
-    "loop-ai": "node --disable-warning=ExperimentalWarning src/cli.ts"
+    "loop-ai": "node --disable-warning=ExperimentalWarning src/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm run build"
   },
   "devDependencies": {
     "@types/node": "^24.13.6",
     "typescript": "^7.0.2"
   },
   "bin": {
-    "loop-ai": "./src/cli.ts"
-  }
+    "loop-ai": "dist/cli.js"
+  },
+  "version": "0.1.0",
+  "description": "goal 과 스펙을 받아 여러 코딩 에이전트(Claude Code·Codex)로 프로젝트를 끝까지 진행하는 오케스트레이터",
+  "license": "UNLICENSED",
+  "files": [
+    "dist",
+    "README.md"
+  ]
 }

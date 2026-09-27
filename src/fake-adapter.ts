@@ -17,6 +17,8 @@ export class FakeAdapter implements Adapter {
   throwAfterRecord = false;
   // 설정하면 launch 하자마자 그 결과로 끝난 것으로 기록한다 (루프 테스트용)
   autoResult: 'succeeded' | 'failed' | undefined;
+  // 설정하면 launch 때 부른다. 작업자가 작업 디렉터리에서 파일을 고치는 것을 흉내 낸다 (테스트용)
+  onLaunch: ((req: LaunchRequest) => void) | undefined;
 
   // 생성자는 기존 저장소를 열기만 한다. 여기서 빈 저장소를 만들면, 기록을 잃은 뒤 새로 띄운
   // 인스턴스가 이전 실행을 not_found 로 잘못 판정해 중복 시작하게 된다.
@@ -47,6 +49,7 @@ export class FakeAdapter implements Adapter {
     const s = this.load();
     if (!s) throw new Error(`어댑터 저장소를 읽을 수 없다: ${this.storePath}`);
     mkdirSync(req.workdir, { recursive: true });
+    this.onLaunch?.(req);
     s.launchCount[req.requestId] = (s.launchCount[req.requestId] ?? 0) + 1;
     s.runs[req.requestId] = this.autoResult ?? 'running';
     this.save(s);

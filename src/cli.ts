@@ -3,25 +3,32 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import type { Adapter } from './adapter.ts';
-import { CliAdapter, readDenials, readOutput, type CliKind } from './cli-adapter.ts';
+import { CliAdapter, readDenials, readOutput, readUsage, type CliKind } from './cli-adapter.ts';
 import { capability, DEFAULT_ACCESS, WORKER_ACCESS, type WorkerAccess } from './policy.ts';
 import { FakeAdapter } from './fake-adapter.ts';
-import { acquireManagerLock } from './lock.ts';
-import { commandIntegrator, inOrderCoordinator, runLoop, type Coordinator } from './loop.ts';
+import { acquireManagerLock, LockHeldError } from './lock.ts';
+import { inOrderCoordinator, runLoop, workspaceIntegrator, type Coordinator } from './loop.ts';
+import { DirWorkspace, GitWorkspace, INTEGRATION_BRANCH, type Workspace } from './workspace.ts';
 import { cliRunner } from './llm.ts';
 import { llmCoordinator } from './llm-coordinator.ts';
-import { Manager, type ManagerOptions, type Notify } from './manager.ts';
+import { llmReviewer } from './reviewer.ts';
+import { makeNotify } from './notify.ts';
+import { Manager, type ManagerOptions, type Notify, type Request } from './manager.ts';
 
 // 프로젝트마다 <dir>/.loop-ai 아래에 상태 DB·어댑터 기록·잠금·보고서를 둔다. 잠금 경로는 여기로 고정한다.
 
 const USAGE = `사용법:
   loop-ai init <dir> --adapter claude|codex [--model <모델>]
                [--coordinator order|llm] [--coordinator-cli claude|codex] [--coordinator-model <모델>]
-               [--worker-access read-only|workspace-write|full]
+               [--worker-access read-only|workspace-write|full] [--workspace dir|git]
   loop-ai policy <dir> [read-only|workspace-write|full]   (값 없이 부르면 현재 정책을 보여 준다)
   loop-ai goal <dir> <목표 문장 | @파일>
-  loop-ai add <dir> <작업ID> --prompt <프롬프트> [--after <작업ID,...>] [--decision <결정ID>] [--max-attempts <n>]
-  loop-ai run <dir> --verify <검증 명령> [--max <동시 실행 수>] [--interval <ms>] [--stall-minutes <분>]
+  loop-ai review <dir> [on|off] [--cli claude|codex] [--model <모델>]   (통합 전 독립 검토)
+  loop-ai role <dir> [<역할 이름> <지침 파일>]   (값 없이 부르면 목록을 보여 준다)
+  loop-ai budget <dir> [--minutes <분>] [--cost-usd <달러>] [--reset]   (값 없이 부르면 현재 예산과 사용량)
+  loop-ai protect <dir> [<파일 패턴> ...]   (작업자가 바꾸면 병합하지 않을 파일. 값 없이 부르면 목록을 보여 준다)
+  loop-ai add <dir> <작업ID> --prompt <프롬프트> [--after <작업ID,...>] [--decision <결정ID>] [--max-attempts <n>] [--role <역할>]
+  loop-ai run <dir> --verify <검증 명령> [--max <동시 실행 수>] [--interval <ms>] [--stall-minutes <분>] [--no-desktop]
   loop-ai status <dir>
   loop-ai answer <dir> <결정ID> <스펙 버전> <응답>
   loop-ai resolve <dir> <attemptID> succeeded|failed
@@ -33,7 +40,33 @@ type Config = {
   coordinator?: { kind: 'order' } | { kind: 'llm'; cli: CliKind; model?: string };
   // 작업자 권한 정책. 없으면 기본값(workspace-write)
   workerAccess?: WorkerAccess;
+  // dir: 작업자마다 빈 디렉터리. git: 프로젝트의 git worktree 를 받고 loop-ai/main 에 병합한다
+  workspace?: 'dir' | 'git';
+  // 보호할 파일 패턴 (인수 테스트 등). git 작업 공간에서만 쓴다
+  protect?: string[];
+  // 통합 전 독립 검토. 없으면 git 작업 공간일 때만 켠다
+  review?: { enabled: boolean; cli?: CliKind; model?: string };
+  // 역할 이름 → 지침 파일 경로. dispatch 때 파일 내용을 작업 프롬프트 앞에 붙인다
+  roles?: Record<string, string>;
 };
+
+function loadRoles(cfg: Config): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, file] of Object.entries(cfg.roles ?? {})) {
+    if (!existsSync(file)) throw new Error(`역할 ${name} 의 지침 파일이 없다: ${file}`);
+    out[name] = readFileSync(file, 'utf8');
+  }
+  return out;
+}
+
+function workspaceOf(dir: string, cfg: Config): Workspace {
+  if (cfg.workspace === 'git') {
+    const ws = new GitWorkspace(path.resolve(dir), paths(dir).root, cfg.protect ?? []);
+    ws.init();
+    return ws;
+  }
+  return new DirWorkspace();
+}
 
 function loadConfig(dir: string): Config {
   return JSON.parse(readFileSync(paths(dir).config, 'utf8')) as Config;
@@ -68,6 +101,34 @@ function open(dir: string, notify?: Notify, mopts?: ManagerOptions): Manager {
   return new Manager(p.db, adapter, p.work, notify, mopts);
 }
 
+// 상태를 바꾸는 명령. 요청함에 넣고, 루프가 돌고 있으면 루프가 다음 tick 에 반영한다.
+// 루프가 없으면 잠금을 잡고 그 자리에서 반영한다. 어느 쪽이든 상태를 고치는 것은 잠금을 쥔 쪽 하나다
+function submit(dir: string, req: Request, done: string): number {
+  const m = open(dir);
+  try {
+    const seq = m.enqueue(req);
+    let lock;
+    try {
+      lock = acquireManagerLock(paths(dir).lock);
+    } catch (e) {
+      if (!(e instanceof LockHeldError)) throw e;
+      console.log(`루프가 실행 중이다. 요청 #${seq} 를 넣었고 다음 tick 에 반영된다 (거절되면 히스토리에 남는다)`);
+      return 0;
+    }
+    try {
+      m.applyRequests();
+    } finally {
+      lock.close();
+    }
+    const r = m.request(seq);
+    if (r?.status === 'rejected') throw new Error(`요청 거절: ${r.result}`);
+    console.log(done);
+    return 0;
+  } finally {
+    m.close();
+  }
+}
+
 async function main(argv: string[]): Promise<number> {
   const [cmd, dir, ...rest] = argv;
   if (!cmd || !dir) {
@@ -83,12 +144,17 @@ async function main(argv: string[]): Promise<number> {
         adapter: { type: 'string' }, model: { type: 'string' },
         coordinator: { type: 'string', default: 'order' }, 'coordinator-cli': { type: 'string' }, 'coordinator-model': { type: 'string' },
         'worker-access': { type: 'string', default: DEFAULT_ACCESS },
+        workspace: { type: 'string' },
       },
     });
     const kind = values.adapter as Config['adapter'];
     if (!['claude', 'codex', 'fake'].includes(kind)) throw new Error('--adapter 는 claude 또는 codex 다');
     if (existsSync(p.config)) throw new Error(`이미 초기화됐다: ${p.root}`);
     const workerAccess = values['worker-access'] as WorkerAccess;
+    // 대상이 git 저장소 최상위면 기본으로 worktree 방식을 쓴다
+    const workspace = (values.workspace ?? (GitWorkspace.isRepo(dir) ? 'git' : 'dir')) as 'dir' | 'git';
+    if (workspace !== 'dir' && workspace !== 'git') throw new Error('--workspace 는 dir 또는 git 이다');
+    if (workspace === 'git' && !GitWorkspace.isRepo(dir)) throw new Error(`${dir} 는 git 저장소 최상위가 아니다`);
     if (!WORKER_ACCESS.includes(workerAccess)) throw new Error(`--worker-access 는 ${WORKER_ACCESS.join('|')} 다`);
     let coordinator: Config['coordinator'] = { kind: 'order' };
     if (values.coordinator === 'llm') {
@@ -99,11 +165,16 @@ async function main(argv: string[]): Promise<number> {
       throw new Error('--coordinator 는 order 또는 llm 이다');
     }
     mkdirSync(p.root, { recursive: true });
-    writeFileSync(p.config, JSON.stringify({ adapter: kind, model: values.model, coordinator, workerAccess }, null, 2));
+    const review = { enabled: workspace === 'git' && kind !== 'fake' };
+    writeFileSync(p.config, JSON.stringify({ adapter: kind, model: values.model, coordinator, workerAccess, workspace, review }, null, 2));
     if (kind === 'fake') FakeAdapter.init(p.adapter);
     else CliAdapter.init(kind, p.adapter, values.model, workerAccess);
     if (workerAccess === 'full') console.error('경고: 작업자 권한이 full 이다. 작업자가 파일·명령·네트워크를 제한 없이 쓴다');
     open(dir).close();
+    if (workspace === 'git') {
+      workspaceOf(dir, { adapter: kind, workspace });
+      console.log(`작업 공간: git worktree. 결과는 ${INTEGRATION_BRANCH} 브랜치에 병합한다 (사용자 브랜치는 건드리지 않는다)`);
+    }
     console.log(`초기화: ${p.root}`);
     return 0;
   }
@@ -125,7 +196,86 @@ async function main(argv: string[]): Promise<number> {
       m.close();
     }
     if (level === 'full') console.error('경고: 작업자 권한이 full 이다. 작업자가 파일·명령·네트워크를 제한 없이 쓴다');
-    console.log(`작업자 권한: ${before} → ${level}. 다음에 띄우는 작업자부터 적용된다`);
+    console.log(`작업자 권한: ${before} → ${level}. 설정 파일에 기록했다. 실행 중인 run 에는 적용되지 않고, run 을 다시 띄우면 적용된다`);
+    return 0;
+  }
+
+  if (cmd === 'review') {
+    const cfg = loadConfig(dir);
+    const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { cli: { type: 'string' }, model: { type: 'string' } } });
+    const state = positionals[0];
+    if (!state) {
+      const r = cfg.review;
+      console.log(`검토: ${r?.enabled ? '켜짐' : '꺼짐'}${r?.enabled ? ` (${r.cli ?? cfg.adapter}${r.model ?? cfg.model ? `, ${r.model ?? cfg.model}` : ''})` : ''}`);
+      return 0;
+    }
+    if (state !== 'on' && state !== 'off') throw new Error('review <dir> on|off');
+    const cli = values.cli as CliKind | undefined;
+    if (cli && cli !== 'claude' && cli !== 'codex') throw new Error('--cli 는 claude 또는 codex 다');
+    const review = { enabled: state === 'on', cli: cli ?? cfg.review?.cli, model: values.model ?? cfg.review?.model };
+    writeFileSync(p.config, JSON.stringify({ ...cfg, review }, null, 2));
+    const m = open(dir);
+    try {
+      m.noteCoordinator('review_changed', `검토 ${state}`);
+    } finally {
+      m.close();
+    }
+    console.log(`검토: ${state === 'on' ? '켜짐' : '꺼짐'}`);
+    return 0;
+  }
+
+  if (cmd === 'role') {
+    const cfg = loadConfig(dir);
+    const [name, file] = rest;
+    if (!name) {
+      console.log(Object.entries(cfg.roles ?? {}).map(([n, f]) => `${n}\t${f}`).join('\n') || '(역할 없음)');
+      return 0;
+    }
+    if (!file || !existsSync(file)) throw new Error('role <dir> <역할 이름> <지침 파일>. 파일이 있어야 한다');
+    if (!/^[a-z0-9][a-z0-9:_-]{0,60}$/.test(name)) throw new Error(`역할 이름 형식이 아니다: ${name}`);
+    writeFileSync(p.config, JSON.stringify({ ...cfg, roles: { ...(cfg.roles ?? {}), [name]: path.resolve(file) } }, null, 2));
+    console.log(`역할 등록: ${name} ← ${path.resolve(file)}`);
+    return 0;
+  }
+
+  if (cmd === 'budget') {
+    const { values } = parseArgs({ args: rest, options: { minutes: { type: 'string' }, 'cost-usd': { type: 'string' }, reset: { type: 'boolean' } } });
+    if (values.minutes || values['cost-usd'] || values.reset) {
+      submit(dir, {
+        kind: 'budget',
+        maxMinutes: values.minutes ? Number(values.minutes) : undefined,
+        maxCostUsd: values['cost-usd'] ? Number(values['cost-usd']) : undefined,
+        reset: values.reset,
+      }, '예산 기록');
+    }
+    const m = open(dir);
+    try {
+      const b = m.budget();
+      const u = m.usageTotals();
+      console.log(`예산: 경과 시간 상한 ${b.maxMinutes ?? '-'}분, 비용 상한 $${b.maxCostUsd ?? '-'}`);
+      console.log(`사용량: 비용 $${u.costUsd.toFixed(4)} (${u.costKnown}회), 비용 모름 ${u.costUnknown}회, 토큰 입력 ${u.inputTokens} · 출력 ${u.outputTokens}`);
+    } finally {
+      m.close();
+    }
+    return 0;
+  }
+
+  if (cmd === 'protect') {
+    const cfg = loadConfig(dir);
+    if (rest.length === 0) {
+      console.log((cfg.protect ?? []).join('\n') || '(보호된 파일 없음)');
+      return 0;
+    }
+    if (cfg.workspace !== 'git') throw new Error('보호는 git 작업 공간에서만 쓴다');
+    const protect = [...new Set([...(cfg.protect ?? []), ...rest])];
+    writeFileSync(p.config, JSON.stringify({ ...cfg, protect }, null, 2));
+    const m = open(dir);
+    try {
+      m.noteCoordinator('protect_changed', `보호 파일: ${protect.join(', ')}`);
+    } finally {
+      m.close();
+    }
+    console.log(`보호 파일: ${protect.join(', ')}`);
     return 0;
   }
 
@@ -133,37 +283,30 @@ async function main(argv: string[]): Promise<number> {
     const text = rest.join(' ');
     if (!text) throw new Error('goal <dir> <목표 문장 | @파일>');
     const goal = text.startsWith('@') ? readFileSync(text.slice(1), 'utf8') : text;
-    const m = open(dir);
-    try {
-      m.setGoal(goal);
-    } finally {
-      m.close();
-    }
-    console.log('목표 기록');
-    return 0;
+    return submit(dir, { kind: 'goal', goal }, '목표 기록');
   }
 
   if (cmd === 'add') {
     const { values, positionals } = parseArgs({
       args: rest, allowPositionals: true,
-      options: { prompt: { type: 'string' }, after: { type: 'string' }, decision: { type: 'string' }, 'max-attempts': { type: 'string' } },
+      options: {
+        prompt: { type: 'string' }, after: { type: 'string' }, decision: { type: 'string' }, 'max-attempts': { type: 'string' },
+        role: { type: 'string' },
+      },
     });
     const id = positionals[0];
     if (!id || !values.prompt) throw new Error('작업ID 와 --prompt 가 필요하다');
-    const m = open(dir);
-    try {
-      if (values.decision && !m.hasDecision(values.decision)) m.openDecision(values.decision);
-      m.addTask(id, {
+    if (values.role && !loadConfig(dir).roles?.[values.role]) throw new Error(`없는 역할: ${values.role}. 먼저 loop-ai role 로 등록한다`);
+    return submit(dir, {
+      kind: 'add', id,
+      opts: {
         prompt: values.prompt,
-        blockedBy: values.decision,
+        decision: values.decision,
         dependsOn: values.after ? values.after.split(',') : [],
         maxAttempts: values['max-attempts'] ? Number(values['max-attempts']) : undefined,
-      });
-    } finally {
-      m.close();
-    }
-    console.log(`작업 추가: ${id}`);
-    return 0;
+        role: values.role,
+      },
+    }, `작업 추가: ${id}`);
   }
 
   if (cmd === 'run') {
@@ -171,23 +314,22 @@ async function main(argv: string[]): Promise<number> {
       args: rest,
       options: {
         verify: { type: 'string' }, max: { type: 'string', default: '2' }, interval: { type: 'string', default: '5000' },
-        'stall-minutes': { type: 'string', default: '15' },
+        'stall-minutes': { type: 'string', default: '15' }, 'no-desktop': { type: 'boolean' },
       },
     });
     if (!values.verify) throw new Error('--verify 가 필요하다. 검증 없이 done 으로 옮기지 않는다');
     const lock = acquireManagerLock(p.lock); // 프로세스가 끝날 때까지 쥐고 있는다
-    const notify: Notify = (report) => {
-      writeFileSync(p.status, report);
-      process.stderr.write(`\n[loop-ai] 멈춘 곳이 생겼다. ${p.status}\n\n${report}\n\n`);
-    };
-    const m = open(dir, notify, { stallAfterMs: Number(values['stall-minutes']) * 60_000 });
+    // STATUS.md·표준 오류에 보고서를 남기고, macOS 면 데스크톱 알림도 띄운다 (기기 밖으로는 보내지 않는다)
+    const notify: Notify = makeNotify(p.status, { desktop: !values['no-desktop'] });
     const cfg = loadConfig(dir);
+    const ws = workspaceOf(dir, cfg);
+    const m = open(dir, notify, { stallAfterMs: Number(values['stall-minutes']) * 60_000, prepareWorkdir: (a) => ws.prepare(a) });
     let coordinator: Coordinator = inOrderCoordinator;
+    const workerKind = cfg.adapter === 'fake' ? undefined : cfg.adapter;
     if (cfg.coordinator?.kind === 'llm') {
       if (!m.goal()) throw new Error('LLM 총괄은 목표가 필요하다. 먼저 loop-ai goal 을 돌린다');
-      const workerKind = cfg.adapter === 'fake' ? undefined : cfg.adapter;
-      const cap = workerKind ? capability(workerKind, cfg.workerAccess ?? DEFAULT_ACCESS) : undefined;
-      coordinator = llmCoordinator(cliRunner(cfg.coordinator.cli, cfg.coordinator.model), () => {
+      const cap = `${ws.description} ${workerKind ? capability(workerKind, cfg.workerAccess ?? DEFAULT_ACCESS) : ''}`.trim();
+      coordinator = llmCoordinator(cliRunner(cfg.coordinator.cli, cfg.coordinator.model, undefined, (u) => m.recordUsage('coordinator', u)), () => {
         const out: Record<string, string> = {};
         for (const t of m.tasks().filter((x) => x.state === 'done')) {
           const a = m.lastSucceeded(t.id);
@@ -204,7 +346,14 @@ async function main(argv: string[]): Promise<number> {
       const r = await runLoop(m, {
         coordinator,
         readDenials: cfg.adapter === 'fake' ? undefined : (a) => readDenials(cfg.adapter as CliKind, a.workdir),
-        integrator: commandIntegrator(values.verify),
+        reviewer: cfg.review?.enabled && cfg.adapter !== 'fake'
+          ? llmReviewer(cliRunner(cfg.review.cli ?? (cfg.adapter as CliKind), cfg.review.model ?? cfg.model, undefined, (u) => m.recordUsage('reviewer', u)))
+          : undefined,
+        changes: (a) => ws.changes(a),
+        readOutput: (a) => (workerKind ? readOutput(workerKind, a.workdir) : undefined),
+        readUsage: (a) => (workerKind ? readUsage(workerKind, a.workdir) : undefined),
+        roles: loadRoles(cfg),
+        integrator: workspaceIntegrator(ws, values.verify),
         maxConcurrent: Number(values.max),
         intervalMs: Number(values.interval),
         signal: ac.signal,
@@ -232,40 +381,19 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === 'answer') {
     const [id, version, answer] = rest;
     if (!id || !version || answer === undefined) throw new Error('answer <dir> <결정ID> <스펙 버전> <응답>');
-    const m = open(dir);
-    try {
-      m.answerDecision(id, Number(version), answer);
-    } finally {
-      m.close();
-    }
-    console.log(`응답 기록: ${id}`);
-    return 0;
+    return submit(dir, { kind: 'answer', id, version: Number(version), answer }, `응답 기록: ${id}`);
   }
 
   if (cmd === 'resolve') {
     const [attemptId, verdict] = rest;
     if (!attemptId || (verdict !== 'succeeded' && verdict !== 'failed')) throw new Error('resolve <dir> <attemptID> succeeded|failed');
-    const m = open(dir);
-    try {
-      m.resolveUnknown(attemptId, verdict);
-    } finally {
-      m.close();
-    }
-    console.log(`판정 기록: ${attemptId} → ${verdict}`);
-    return 0;
+    return submit(dir, { kind: 'resolve', attemptId, verdict }, `판정 기록: ${attemptId} → ${verdict}`);
   }
 
   if (cmd === 'grant') {
     const [taskId, n = '1'] = rest;
     if (!taskId) throw new Error('grant <dir> <작업ID> [<횟수>]');
-    const m = open(dir);
-    try {
-      m.grantAttempts(taskId, Number(n));
-    } finally {
-      m.close();
-    }
-    console.log(`시도 ${n}회 추가: ${taskId}`);
-    return 0;
+    return submit(dir, { kind: 'grant', taskId, n: Number(n) }, `시도 ${n}회 추가: ${taskId}`);
   }
 
   console.error(USAGE);

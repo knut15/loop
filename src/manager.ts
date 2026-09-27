@@ -17,23 +17,33 @@ export type AttemptStatus = 'intent' | 'launched' | 'launch_unknown' | 'succeede
 
 export type Task = {
   id: string; state: TaskState; version: number; blocked_by: string | null; commit_sha: string | null;
-  prompt: string; depends_on: string; max_attempts: number;
+  prompt: string; depends_on: string; max_attempts: number; role?: string | null;
 };
-export type TaskOptions = { prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number };
+export type TaskOptions = { prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number; role?: string };
 export type Attempt = {
   id: string; task_id: string; request_id: string; workdir: string; prompt: string; status: AttemptStatus;
   last_lookup: string | null; started_at?: number | null;
 };
 export type Notify = (report: string) => void;
+export type Request =
+  | { kind: 'add'; id: string; opts: TaskOptions & { decision?: string } }
+  | { kind: 'goal'; goal: string }
+  | { kind: 'answer'; id: string; version: number; answer: string }
+  | { kind: 'resolve'; attemptId: string; verdict: 'succeeded' | 'failed' }
+  | { kind: 'grant'; taskId: string; n: number }
+  | { kind: 'budget'; maxMinutes?: number; maxCostUsd?: number; reset?: boolean };
+export type Usage = { costUsd?: number | null; inputTokens?: number; outputTokens?: number };
+export type UsageTotals = { costUsd: number; costKnown: number; costUnknown: number; inputTokens: number; outputTokens: number };
 // stallAfterMs: 작업자가 살아 있어도 이 시간을 넘기면 멈춤으로 알린다. 죽이거나 재시도하지는 않는다
-export type ManagerOptions = { stallAfterMs?: number; now?: () => number };
+// prepareWorkdir: 작업자를 띄우기 직전에 작업 디렉터리를 만든다 (git worktree 등). 실패하면 그 시도는 실패로 기록한다
+export type ManagerOptions = { stallAfterMs?: number; now?: () => number; prepareWorkdir?: (a: Attempt) => void };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
   blocked_by TEXT, commit_sha TEXT,
-  prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3
+  prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3, role TEXT
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -48,6 +58,16 @@ CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, spec_version INTEGER NOT NULL, status TEXT NOT NULL, answer TEXT, question TEXT
 );
 -- 작업·시도에 묶이지 않는 멈춤(총괄 호출 실패 등). active 인 것만 attention 에 오른다
+-- 작업자·총괄·검토자 호출의 사용량. 비용을 모르면 cost_usd 가 NULL 이다 (Codex 는 토큰 수만 준다)
+CREATE TABLE IF NOT EXISTS usage (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, source TEXT NOT NULL, task_id TEXT, attempt_id TEXT,
+  cost_usd REAL, input_tokens INTEGER, output_tokens INTEGER
+);
+-- 요청함. CLI 명령은 상태를 직접 고치지 않고 여기에 넣기만 한다. 잠금을 쥔 쪽(루프 또는 잠금을 얻은 CLI)이 검증해 반영한다
+CREATE TABLE IF NOT EXISTS requests (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', result TEXT
+);
 CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, task_id TEXT, reason TEXT NOT NULL, next TEXT NOT NULL, active INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS history (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, task_id TEXT, attempt_id TEXT, kind TEXT NOT NULL, detail TEXT NOT NULL
@@ -64,10 +84,12 @@ export class Manager {
 
   readonly stallAfterMs: number;
   readonly now: () => number;
+  readonly prepareWorkdir: ((a: Attempt) => void) | undefined;
 
   constructor(dbPath: string, adapter: Adapter, workRoot: string, notify?: Notify, opts: ManagerOptions = {}) {
     this.stallAfterMs = opts.stallAfterMs ?? 15 * 60_000;
     this.now = opts.now ?? Date.now;
+    this.prepareWorkdir = opts.prepareWorkdir;
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.db.exec(SCHEMA);
@@ -88,6 +110,7 @@ export class Manager {
       ['attempts', 'last_lookup', 'TEXT'],
       ['decisions', 'question', 'TEXT'],
       ['attempts', 'started_at', 'INTEGER'],
+      ['tasks', 'role', 'TEXT'],
     ];
     for (const [table, col, def] of add) {
       if (!has(table, col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
@@ -158,7 +181,7 @@ export class Manager {
   // 작업 상태를 바꾼 기록만 센 마지막 번호. 알림·거절·총괄 실패 같은 기록은 총괄을 다시 부를 이유가 아니다
   stateSeq(): number {
     return (this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM history
-      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied')`).get() as { n: number }).n;
+      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied', 'review_failed')`).get() as { n: number }).n;
   }
 
   attemptCounts(): Record<string, number> {
@@ -168,6 +191,84 @@ export class Manager {
 
   decisions(): { id: string; spec_version: number; status: string; question: string | null; answer: string | null }[] {
     return this.db.prepare('SELECT id, spec_version, status, question, answer FROM decisions ORDER BY rowid').all() as never;
+  }
+
+  // 요청함에 넣는다. 반영은 잠금을 쥔 쪽이 applyRequests 로 한다
+  enqueue(r: Request): number {
+    return Number(this.db.prepare('INSERT INTO requests (at, kind, payload) VALUES (?, ?, ?)')
+      .run(new Date().toISOString(), r.kind, JSON.stringify(r)).lastInsertRowid);
+  }
+
+  request(seq: number): { status: string; result: string | null } | undefined {
+    return this.db.prepare('SELECT status, result FROM requests WHERE seq = ?').get(seq) as { status: string; result: string | null } | undefined;
+  }
+
+  // 대기 중인 요청을 들어온 순서대로 검증해 반영한다. 잠금을 쥔 쪽만 부른다
+  applyRequests(): number {
+    const pending = this.db.prepare(`SELECT seq, payload FROM requests WHERE status = 'pending' ORDER BY seq`).all() as { seq: number; payload: string }[];
+    for (const { seq, payload } of pending) {
+      const r = JSON.parse(payload) as Request;
+      let status = 'applied';
+      let result = '';
+      try {
+        if (r.kind === 'add') {
+          if (r.opts.decision && !this.hasDecision(r.opts.decision)) this.openDecision(r.opts.decision);
+          this.addTask(r.id, { ...r.opts, blockedBy: r.opts.decision ?? r.opts.blockedBy });
+        } else if (r.kind === 'goal') this.setGoal(r.goal);
+        else if (r.kind === 'answer') this.answerDecision(r.id, r.version, r.answer);
+        else if (r.kind === 'resolve') this.resolveUnknown(r.attemptId, r.verdict);
+        else if (r.kind === 'grant') this.grantAttempts(r.taskId, r.n);
+        else if (r.kind === 'budget') this.setBudget(r);
+        else throw new Error(`모르는 요청: ${(r as { kind: string }).kind}`);
+      } catch (e) {
+        status = 'rejected';
+        result = e instanceof Error ? e.message : String(e);
+        this.log(null, null, 'request_rejected', `요청 #${seq} (${r.kind}) 거절: ${result.slice(0, 200)}`);
+      }
+      this.db.prepare('UPDATE requests SET status = ?, result = ? WHERE seq = ?').run(status, result, seq);
+    }
+    return pending.length;
+  }
+
+  recordUsage(source: string, u: Usage, taskId?: string, attemptId?: string): void {
+    this.db.prepare('INSERT INTO usage (at, source, task_id, attempt_id, cost_usd, input_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(new Date().toISOString(), source, taskId ?? null, attemptId ?? null, u.costUsd ?? null, u.inputTokens ?? null, u.outputTokens ?? null);
+  }
+
+  usageTotals(): UsageTotals {
+    const r = this.db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS c, COUNT(cost_usd) AS k, COUNT(*) - COUNT(cost_usd) AS u,
+      COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o FROM usage`).get() as { c: number; k: number; u: number; i: number; o: number };
+    return { costUsd: r.c, costKnown: r.k, costUnknown: r.u, inputTokens: r.i, outputTokens: r.o };
+  }
+
+  // 예산. 값은 meta 에 둔다. 경과 시간은 예산을 정한 때부터 잰다
+  budget(): { maxMinutes?: number; maxCostUsd?: number; startedAt?: number } {
+    const n = (k: string) => (this.meta(k) ? Number(this.meta(k)) : undefined);
+    return { maxMinutes: n('budget_max_minutes'), maxCostUsd: n('budget_max_cost_usd'), startedAt: n('budget_started_at') };
+  }
+
+  setBudget(b: { maxMinutes?: number; maxCostUsd?: number; reset?: boolean }): void {
+    if (b.maxMinutes !== undefined) this.setMeta('budget_max_minutes', String(b.maxMinutes));
+    if (b.maxCostUsd !== undefined) this.setMeta('budget_max_cost_usd', String(b.maxCostUsd));
+    if (b.reset || !this.meta('budget_started_at')) this.setMeta('budget_started_at', String(this.now()));
+    const cur = this.budget();
+    this.log(null, null, 'budget_set', `경과 시간 상한 ${cur.maxMinutes ?? '-'}분, 비용 상한 $${cur.maxCostUsd ?? '-'}`);
+  }
+
+  // 예산을 넘었으면 이유를 돌려준다
+  budgetExceeded(): string | undefined {
+    const b = this.budget();
+    if (b.maxMinutes !== undefined && b.startedAt !== undefined) {
+      const min = (this.now() - b.startedAt) / 60_000;
+      if (min >= b.maxMinutes) return `경과 시간 ${Math.floor(min)}분이 상한 ${b.maxMinutes}분에 닿았다`;
+    }
+    if (b.maxCostUsd !== undefined) {
+      const t = this.usageTotals();
+      if (t.costUsd >= b.maxCostUsd) {
+        return `기록된 비용 $${t.costUsd.toFixed(4)}가 상한 $${b.maxCostUsd}에 닿았다${t.costUnknown ? ` (비용을 모르는 호출 ${t.costUnknown}건은 빠져 있다)` : ''}`;
+      }
+    }
+    return undefined;
   }
 
   // 작업·시도에 묶이지 않는 멈춤을 올리거나 내린다
@@ -182,6 +283,10 @@ export class Manager {
 
   clearFlagPrefix(prefix: string): void {
     this.db.prepare(`UPDATE flags SET active = 0 WHERE key LIKE ? || '%'`).run(prefix);
+  }
+
+  noteReview(taskId: string, attemptId: string, approved: boolean, detail: string): void {
+    this.log(taskId, attemptId, approved ? 'review_approved' : 'review_rejected', detail.slice(0, 300));
   }
 
   noteDenied(taskId: string, attemptId: string, denied: string[]): void {
@@ -199,9 +304,9 @@ export class Manager {
   }
 
   addTask(id: string, opts: TaskOptions = {}): void {
-    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3 } = opts;
-    this.db.prepare('INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts);
+    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3, role } = opts;
+    this.db.prepare('INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts, role ?? null);
     const why = [blockedBy && `결정 ${blockedBy} 대기`, dependsOn.length && `선행 ${dependsOn.join(', ')}`].filter(Boolean).join(', ');
     this.log(id, null, 'task_added', why ? `추가 (${why})` : '실행 가능으로 추가');
   }
@@ -277,6 +382,7 @@ export class Manager {
       return a;
     });
     if (crashAt === 'after_intent') throw new SimulatedCrash('의도 저장 직후');
+    if (!this.prepare(attempt)) return { ...attempt, status: 'failed' };
     await this.adapter.launch({ requestId: attempt.request_id, workdir: attempt.workdir, prompt: attempt.prompt });
     if (crashAt === 'after_launch') throw new SimulatedCrash('실행 직후, launched 기록 전');
     this.db.prepare(`UPDATE attempts SET status = 'launched' WHERE id = ? AND status = 'intent'`).run(attempt.id);
@@ -306,6 +412,7 @@ export class Manager {
         this.onResult(`lookup:${a.id}`, a.id, r);
       } else if (r === 'not_found' && a.status === 'intent') {
         // 시작된 적이 없다고 어댑터가 확인해 줬으므로 같은 request_id 로 시작한다
+        if (!this.prepare(a)) continue;
         await this.adapter.launch({ requestId: a.request_id, workdir: a.workdir, prompt: a.prompt });
         this.moveAttempt(a, 'launched', r);
         this.log(a.task_id, a.id, 'launched', '재조회: 시작된 적 없음 → 같은 request_id 로 시작');
@@ -356,7 +463,7 @@ export class Manager {
         key: `slow:${a.id}`,
         taskId: a.task_id,
         reason: `작업자가 ${min}분째 끝나지 않는다 (프로세스는 살아 있다)`,
-        next: `${a.workdir} 의 out.jsonl·err.txt 를 확인한다. 멈춘 것이면 표지 loop-ai:${a.request_id} 가 붙은 프로세스 그룹을 종료한다. 그러면 다음 tick 에 사라진 작업자로 보고되고 resolveUnknown 으로 판정할 수 있다`,
+        next: `${a.workdir}.run 의 out.jsonl·err.txt 를 확인한다. 멈춘 것이면 표지 loop-ai:${a.request_id} 가 붙은 프로세스 그룹을 종료한다. 그러면 다음 tick 에 사라진 작업자로 보고되고 resolveUnknown 으로 판정할 수 있다`,
       });
     }
     const open = this.db.prepare(`SELECT id, spec_version, question FROM decisions WHERE status = 'open' ORDER BY rowid`).all() as { id: string; spec_version: number; question: string | null }[];
@@ -375,7 +482,10 @@ export class Manager {
   }
 
   report(): string {
-    return renderReport({ at: new Date().toISOString(), tasks: this.tasks(), runnable: this.runnable(), attention: this.attention(), history: this.history() });
+    return renderReport({
+      at: new Date().toISOString(), tasks: this.tasks(), runnable: this.runnable(), attention: this.attention(), history: this.history(),
+      usage: this.usageTotals(), budget: this.budget(), now: this.now(),
+    });
   }
 
   // 새로 멈춘 곳이 있으면 알린다. 실제로 전달된 뒤에만 보낸 것으로 기록하고, 실패하면 다음에 다시 보낸다.
@@ -413,6 +523,19 @@ export class Manager {
     }
     this.log(a.task_id, a.id, 'resolved', `사람이 ${verdict} 로 판정`);
     this.onResult(`human:${a.id}`, a.id, verdict);
+  }
+
+  // 작업 디렉터리를 준비한다. 실패하면 시도를 실패로 기록해 재시도·시도 상한 알림으로 이어지게 한다
+  private prepare(a: Attempt): boolean {
+    if (!this.prepareWorkdir) return true;
+    try {
+      this.prepareWorkdir(a);
+      return true;
+    } catch (e) {
+      this.log(a.task_id, a.id, 'workspace_failed', `작업 디렉터리 준비 실패: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
+      this.onResult(`prepare:${a.id}`, a.id, 'failed');
+      return false;
+    }
   }
 
   // 읽었을 때의 상태가 그대로일 때만 바꾼다. 그 사이 다른 쪽이 바꿨으면 아무것도 하지 않는다
@@ -463,16 +586,16 @@ export class Manager {
   }
 
   // 통합된 SHA 에서 검증을 통과해야 done 이 된다
-  integrate(taskId: string, commitSha: string, testsPassed: boolean): void {
+  integrate(taskId: string, commitSha: string, testsPassed: boolean, note?: string): void {
     this.tx(() => {
       const t = this.task(taskId);
       if (t.state !== 'integrating') throw new Rejected(`통합 단계가 아니다: ${t.state}`);
       if (testsPassed) {
         this.db.prepare(`UPDATE tasks SET state = 'done', commit_sha = ?, version = version + 1 WHERE id = ?`).run(commitSha, taskId);
-        this.log(taskId, null, 'done', `검증 통과 (${commitSha})`);
+        this.log(taskId, null, 'done', `검증 통과 (${commitSha})${note ? ` — ${note}` : ''}`);
       } else {
         this.bump(taskId, 'ready');
-        this.log(taskId, null, 'rework', `검증 실패 (${commitSha}) → 다시 실행 가능`);
+        this.log(taskId, null, 'rework', `검증 실패 (${commitSha})${note ? ` — ${note}` : ''} → 다시 실행 가능`);
       }
     });
   }

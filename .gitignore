@@ -2,3 +2,5 @@ node_modules/
 .data/
 .omc/
 docs/diagrams/*.visual-check.*
+dist/
+*.tgz

@@ -31,16 +31,24 @@ function run(cmd: string, args: string[], cwd: string, timeoutMs: number): Promi
   });
 }
 
-export function cliRunner(kind: 'claude' | 'codex', model?: string, timeoutMs = 180_000): LlmRunner {
+export type LlmUsage = { costUsd?: number | null; inputTokens?: number; outputTokens?: number };
+
+// onUsage: 호출마다 사용량을 알려 준다. Claude 는 비용까지, Codex 는 토큰 수만 준다
+export function cliRunner(kind: 'claude' | 'codex', model?: string, timeoutMs = 180_000, onUsage?: (u: LlmUsage) => void): LlmRunner {
   return async (prompt, schema) => {
     // 빈 임시 디렉터리에서 부른다. 프로젝트 파일을 읽거나 바꾸지 않게 하려는 것이다
     const cwd = mkdtempSync(path.join(tmpdir(), 'loop-ai-llm-'));
     if (kind === 'claude') {
       const out = await run('claude', [
-        '-p', '--no-session-persistence', '--tools', '', '--output-format', 'json',
+        // 판단만 하는 호출이라 도구·MCP 를 모두 뗀다
+        '-p', '--no-session-persistence', '--tools', '', '--strict-mcp-config', '--output-format', 'json',
         '--json-schema', JSON.stringify(schema), ...(model ? ['--model', model] : []), '--', prompt,
       ], cwd, timeoutMs);
-      const r = JSON.parse(out) as { is_error?: boolean; structured_output?: unknown; result?: string };
+      const r = JSON.parse(out) as {
+        is_error?: boolean; structured_output?: unknown; result?: string; total_cost_usd?: number;
+        usage?: { input_tokens?: number; output_tokens?: number };
+      };
+      onUsage?.({ costUsd: r.total_cost_usd ?? null, inputTokens: r.usage?.input_tokens, outputTokens: r.usage?.output_tokens });
       if (r.is_error) throw new Error(`claude 오류: ${String(r.result).slice(0, 300)}`);
       if (r.structured_output === undefined) throw new Error('claude 가 structured_output 을 돌려주지 않았다');
       return r.structured_output;
@@ -48,15 +56,16 @@ export function cliRunner(kind: 'claude' | 'codex', model?: string, timeoutMs = 
     const schemaPath = path.join(cwd, 'schema.json');
     writeFileSync(schemaPath, JSON.stringify(schema));
     const out = await run('codex', [
-      'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-s', 'read-only',
+      'exec', '--json', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '-s', 'read-only',
       '--output-schema', schemaPath, ...(model ? ['-m', model] : []), prompt,
     ], cwd, timeoutMs);
     // 마지막 agent_message 가 스키마에 맞춘 JSON 이다
     let last: string | undefined;
     for (const line of out.split('\n')) {
       if (!line.trim()) continue;
-      const ev = JSON.parse(line) as { type?: string; item?: { type?: string; text?: string } };
+      const ev = JSON.parse(line) as { type?: string; item?: { type?: string; text?: string }; usage?: { input_tokens?: number; output_tokens?: number } };
       if (ev.type === 'item.completed' && ev.item?.type === 'agent_message') last = ev.item.text;
+      if (ev.type === 'turn.completed') onUsage?.({ costUsd: null, inputTokens: ev.usage?.input_tokens, outputTokens: ev.usage?.output_tokens });
     }
     if (last === undefined) throw new Error('codex 가 최종 메시지를 돌려주지 않았다');
     return JSON.parse(last);

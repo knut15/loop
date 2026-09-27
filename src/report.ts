@@ -9,9 +9,12 @@ type ReportInput = {
   runnable: string[];
   attention: Attention[];
   history: HistoryEntry[];
+  usage?: { costUsd: number; costKnown: number; costUnknown: number; inputTokens: number; outputTokens: number };
+  budget?: { maxMinutes?: number; maxCostUsd?: number; startedAt?: number };
+  now?: number;
 };
 
-export function renderReport({ at, tasks, runnable, attention, history }: ReportInput): string {
+export function renderReport({ at, tasks, runnable, attention, history, usage, budget, now }: ReportInput): string {
   const lines: string[] = [`# loop-ai 상태 보고 (${at})`, ''];
 
   lines.push(`## 멈춘 곳 (${attention.length})`, '');
@@ -22,6 +25,18 @@ export function renderReport({ at, tasks, runnable, attention, history }: Report
   lines.push('## 작업', '', '| 작업 | 상태 | 버전 |', '| --- | --- | --- |');
   for (const t of tasks) lines.push(`| ${t.id} | ${t.state} | ${t.version} |`);
   lines.push('');
+
+  if (usage) {
+    lines.push('## 사용량', '');
+    lines.push(`- 기록된 비용: $${usage.costUsd.toFixed(4)} (${usage.costKnown}회)`);
+    if (usage.costUnknown) lines.push(`- 비용을 모르는 호출: ${usage.costUnknown}회 (Codex 는 토큰 수만 준다)`);
+    lines.push(`- 토큰: 입력 ${usage.inputTokens}, 출력 ${usage.outputTokens}`);
+    if (budget?.maxMinutes !== undefined || budget?.maxCostUsd !== undefined) {
+      const min = budget.startedAt !== undefined && now !== undefined ? Math.floor((now - budget.startedAt) / 60_000) : '-';
+      lines.push(`- 예산: 경과 ${min}분 / 상한 ${budget.maxMinutes ?? '-'}분, 비용 상한 $${budget.maxCostUsd ?? '-'}`);
+    }
+    lines.push('');
+  }
 
   lines.push(`## 최근 히스토리 (${history.length})`, '');
   for (const h of history) {

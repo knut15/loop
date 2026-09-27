@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { Rejected, type Attempt, type Manager, type Task } from './manager.ts';
+import { Rejected, type Attempt, type Manager, type Task, type Usage } from './manager.ts';
 import type { HistoryEntry } from './report.ts';
+import type { IntegrationResult, Workspace } from './workspace.ts';
+import type { Reviewer } from './reviewer.ts';
 
 // 실행 루프. tick 마다 ① 재조회·멈춤 알림 ② 검증 ③ 총괄 호출과 제안 적용을 한다.
 // 상태는 모두 Manager(SQLite)에 있으므로 루프 프로세스가 죽어도 다시 띄우면 이어서 돈다.
@@ -9,7 +11,7 @@ import type { HistoryEntry } from './report.ts';
 export type Proposal =
   // prompt 를 주면 저장된 프롬프트 대신 쓴다. 선행 작업의 결과를 옮겨 담을 때 쓴다
   | { kind: 'dispatch'; taskId: string; expectedVersion: number; prompt?: string }
-  | { kind: 'add_task'; id: string; prompt: string; dependsOn: string[]; blockedBy?: string }
+  | { kind: 'add_task'; id: string; prompt: string; dependsOn: string[]; blockedBy?: string; role?: string }
   | { kind: 'ask_user'; decisionId: string; question: string };
 
 // goalComplete: 총괄이 목표 달성 여부를 판단할 때만 채운다. 비워 두면 "모든 작업 done" 이 곧 완료다
@@ -23,6 +25,8 @@ export type Snapshot = {
   attempts: Record<string, number>;
   decisions: ReturnType<Manager['decisions']>;
   history: HistoryEntry[];
+  // 쓸 수 있는 작업자 역할 이름과 한 줄 설명
+  roles?: { name: string; summary: string }[];
 };
 
 export interface Coordinator {
@@ -31,7 +35,7 @@ export interface Coordinator {
   propose(s: Snapshot): Plan | Promise<Plan>;
 }
 
-export type IntegrationResult = { passed: boolean; sha: string };
+export type { IntegrationResult };
 export type Integrator = (task: Task, attempt: Attempt) => Promise<IntegrationResult>;
 
 // 실행 가능한 작업을 추가된 순서대로 제안한다
@@ -44,6 +48,11 @@ export const inOrderCoordinator: Coordinator = {
     };
   },
 };
+
+// 작업 공간(빈 디렉터리 또는 git worktree)에 맞게 통합하고 검증한다
+export function workspaceIntegrator(ws: Workspace, verify: string): Integrator {
+  return async (task, attempt) => ws.integrate(task, attempt, verify);
+}
 
 // 작업자의 작업 디렉터리에서 검증 명령을 돌려 종료 코드로 판정한다. 프로젝트와 병합하지는 않는다
 export function commandIntegrator(command: string): Integrator {
@@ -73,6 +82,15 @@ export type LoopOptions = {
   onTick?: (m: Manager) => void;
   // 끝난 시도에서 권한 밖이라 거절당한 요청을 읽는다. 있으면 조용히 넘기지 않고 알린다
   readDenials?: (a: Attempt) => string[];
+  // 독립 검토자. 있으면 통합 전에 변경을 검토하고, 반려하면 의견을 붙여 다시 돌린다
+  reviewer?: Reviewer;
+  // 검토자에게 보여 줄 변경 내용과 작업자의 마지막 응답
+  changes?: (a: Attempt) => string;
+  readOutput?: (a: Attempt) => string | undefined;
+  // 역할 이름 → 역할 지침. dispatch 할 때 작업 프롬프트 앞에 붙인다
+  roles?: Record<string, string>;
+  // 끝난 작업자 시도의 사용량을 읽는다. 예산 계산에 쓴다
+  readUsage?: (a: Attempt) => Usage | undefined;
 };
 
 export type LoopResult = { status: 'done' | 'stopped' | 'max_ticks'; ticks: number };
@@ -85,19 +103,89 @@ const ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const COORDINATOR_FAILURE_ALERT = 3;
 
 export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
+  // CLI 명령이 넣어 둔 요청을 먼저 반영한다. 상태를 고치는 것은 잠금을 쥔 루프 하나다
+  m.applyRequests();
   await m.recover();
   if (opts.readDenials) checkDenials(m, opts.readDenials);
+  if (opts.readUsage) recordWorkerUsage(m, opts.readUsage);
 
   for (const t of m.tasks().filter((x) => x.state === 'integrating')) {
     const a = m.lastSucceeded(t.id);
     if (!a) continue;
+    if (opts.reviewer && !(await review(m, opts, t, a))) continue;
     const r = await opts.integrator(t, a);
-    m.integrate(t.id, r.sha, r.passed);
+    m.integrate(t.id, r.sha, r.passed, r.note);
+    // 통합이 사람의 판단을 요구하면 작업마다 한 번 알린다. 그 작업이 done 이 되면 내린다
+    if (r.alert) m.setFlag(`integration:${t.id}`, t.id, r.alert.reason, r.alert.next);
+    if (r.passed) m.clearFlag(`integration:${t.id}`);
   }
 
   await consult(m, opts);
   // 새로 생긴 멈춤(시도 상한, 총괄 실패 등)은 제안을 적용한 뒤에도 확인한다
   m.alertIfNeeded();
+}
+
+// 검토자 호출이 이만큼 연속 실패하면 멈춤으로 알린다
+const REVIEWER_FAILURE_ALERT = 3;
+
+// 통합해도 되면 true. 반려하면 작업을 다시 실행 가능으로 돌리고 의견을 남긴다. 검토자 호출이 실패하면
+// 다음 tick 에 다시 검토한다 (false)
+async function review(m: Manager, opts: LoopOptions, t: Task, a: Attempt): Promise<boolean> {
+  const key = `review_ok:${a.id}`;
+  if (m.meta(key)) return true;
+  let v;
+  try {
+    v = await opts.reviewer!({
+      goal: m.goal(), taskId: t.id, prompt: a.prompt, changes: opts.changes?.(a) ?? '', output: opts.readOutput?.(a),
+    });
+  } catch (e) {
+    const n = Number(m.meta('review_failures') ?? 0) + 1;
+    m.setMeta('review_failures', String(n));
+    const msg = e instanceof Error ? e.message : String(e);
+    m.noteCoordinator('review_failed', `검토자 호출 실패 ${n}회째: ${msg.slice(0, 200)}`);
+    if (n >= REVIEWER_FAILURE_ALERT) {
+      m.setFlag('reviewer_failed', null, `검토자 호출이 ${n}번 연속 실패했다: ${msg.slice(0, 200)}`,
+        '검토자 CLI 가 로그인돼 있는지, 네트워크와 사용량 한도를 확인한다. 루프는 다음 tick 에 다시 부른다');
+    }
+    return false;
+  }
+  m.setMeta('review_failures', '0');
+  m.clearFlag('reviewer_failed');
+  if (v.approve) {
+    m.setMeta(key, '1');
+    m.noteReview(t.id, a.id, true, v.summary);
+    return true;
+  }
+  const feedback = v.issues.length ? v.issues.map((x) => `- ${x}`).join('\n') : v.summary;
+  m.setMeta(`review_feedback:${t.id}`, feedback);
+  m.noteReview(t.id, a.id, false, `${v.summary} | ${v.issues.join(' / ')}`);
+  m.integrate(t.id, 'review', false, `검토 반려: ${v.summary}`);
+  return false;
+}
+
+// dispatch 할 프롬프트를 만든다. 역할 지침을 앞에, 이전 검토 의견을 뒤에 붙인다
+function composePrompt(m: Manager, opts: LoopOptions, t: Task, base: string): string {
+  const role = t.role ? opts.roles?.[t.role] : undefined;
+  const fb = m.meta(`review_feedback:${t.id}`);
+  return [
+    role ? `${role.trim()}\n\n---\n` : '',
+    base,
+    fb ? `\n\nReviewer feedback on the previous attempt. Fix these:\n${fb}` : '',
+  ].join('');
+}
+
+// 끝난 시도마다 한 번씩 작업자 사용량을 기록한다
+function recordWorkerUsage(m: Manager, read: (a: Attempt) => Usage | undefined): void {
+  for (const t of m.tasks()) {
+    for (const a of m.attempts(t.id)) {
+      if (a.status !== 'succeeded' && a.status !== 'failed') continue;
+      const key = `usage_recorded:${a.id}`;
+      if (m.meta(key)) continue;
+      m.setMeta(key, '1');
+      const u = read(a);
+      if (u) m.recordUsage('worker', u, t.id, a.id);
+    }
+  }
 }
 
 // 끝난 시도마다 한 번씩 권한 거절을 확인한다. 거절은 작업을 멈추지 않지만, 정책 밖 행동이 필요했다는
@@ -123,6 +211,16 @@ function checkDenials(m: Manager, read: (a: Attempt) => string[]): void {
 async function consult(m: Manager, opts: LoopOptions): Promise<void> {
   const coordinator = opts.coordinator ?? inOrderCoordinator;
   const capacity = opts.maxConcurrent - m.liveCount();
+  // 예산을 넘으면 새 작업을 내지 않고 총괄도 부르지 않는다. 돌고 있는 작업자는 멈추지 않는다
+  const over = m.budgetExceeded();
+  const b = m.budget();
+  const budgetKey = `budget:${b.maxMinutes ?? '-'}:${b.maxCostUsd ?? '-'}:${b.startedAt ?? '-'}`;
+  if (over) {
+    m.setFlag(budgetKey, null, `예산을 넘어 새 작업을 멈췄다: ${over}`,
+      '예산을 늘리거나(loop-ai budget) 남은 작업을 줄인다. 돌고 있는 작업자는 끝날 때까지 둔다');
+    return;
+  }
+  m.clearFlagPrefix('budget:');
   const seq = m.stateSeq();
   if (String(seq) === m.meta('coordinator_seq') || capacity <= 0) return;
 
@@ -131,6 +229,7 @@ async function consult(m: Manager, opts: LoopOptions): Promise<void> {
     plan = await coordinator.propose({
       goal: m.goal(), tasks: m.tasks(), runnable: m.runnable(), capacity,
       attempts: m.attemptCounts(), decisions: m.decisions(), history: m.history(30),
+      roles: Object.entries(opts.roles ?? {}).map(([name, text]) => ({ name, summary: summarize(text) })),
     });
     if (!plan || !Array.isArray(plan.proposals)) throw new Error('제안 형식이 아니다');
   } catch (e) {
@@ -145,7 +244,7 @@ async function consult(m: Manager, opts: LoopOptions): Promise<void> {
     m.setMeta('coordinator_failures', '0');
   }
 
-  const changed = await applyPlan(m, plan, capacity);
+  const changed = await applyPlan(m, plan, capacity, opts);
   m.setMeta('goal_complete', plan.goalComplete === true ? '1' : '0');
   // 모든 작업이 끝났는데 총괄이 목표 미완료라 하면서 다음 작업을 내지 않으면 루프가 할 일이 없다. 알린다
   const done = m.tasks().length > 0 && m.tasks().every((t) => t.state === 'done');
@@ -174,7 +273,7 @@ function coordinatorFailed(m: Manager, e: unknown): void {
 
 // 총괄의 제안을 하나씩 검증해 적용한다. 거절한 것은 이유와 함께 히스토리에 남긴다
 // 작업이나 결정을 새로 만들었으면 true
-async function applyPlan(m: Manager, plan: Plan, capacity: number): Promise<boolean> {
+async function applyPlan(m: Manager, plan: Plan, capacity: number, opts: LoopOptions): Promise<boolean> {
   let added = 0;
   let asked = 0;
   let dispatched = 0;
@@ -191,7 +290,8 @@ async function applyPlan(m: Manager, plan: Plan, capacity: number): Promise<bool
           if (!m.tasks().some((t) => t.id === d)) throw new Rejected(`없는 선행 작업: ${d}`);
         }
         if (p.blockedBy && !m.hasDecision(p.blockedBy)) throw new Rejected(`없는 결정: ${p.blockedBy}`);
-        m.addTask(p.id, { prompt: p.prompt, dependsOn: p.dependsOn ?? [], blockedBy: p.blockedBy });
+        if (p.role && !opts.roles?.[p.role]) throw new Rejected(`없는 역할: ${p.role}`);
+        m.addTask(p.id, { prompt: p.prompt, dependsOn: p.dependsOn ?? [], blockedBy: p.blockedBy, role: p.role });
         added++;
       } else if (p.kind === 'ask_user') {
         if (!ID.test(p.decisionId)) throw new Rejected(`결정 ID 형식이 아니다: ${p.decisionId}`);
@@ -204,7 +304,7 @@ async function applyPlan(m: Manager, plan: Plan, capacity: number): Promise<bool
         if (dispatched >= capacity) throw new Rejected(`동시 실행 상한을 넘는 제안: ${p.taskId}`);
         const t = m.task(p.taskId);
         // 버전·상태·선행 작업·시도 상한 검증은 dispatch 가 한다
-        await m.dispatch(t.id, p.expectedVersion, p.prompt?.trim() ? p.prompt : t.prompt);
+        await m.dispatch(t.id, p.expectedVersion, composePrompt(m, opts, t, p.prompt?.trim() ? p.prompt : t.prompt));
         dispatched++;
       } else {
         throw new Rejected(`모르는 제안 종류: ${(p as { kind?: string }).kind}`);
@@ -236,4 +336,11 @@ export async function runLoop(m: Manager, opts: LoopOptions): Promise<LoopResult
       return { status: 'stopped', ticks };
     }
   }
+}
+
+// 역할 지침의 첫 설명 줄. 마크다운 머리말(---)이 있으면 description 을 쓴다
+function summarize(text: string): string {
+  const m = /^description:\s*(.+)$/m.exec(text);
+  if (m) return m[1]!.slice(0, 160);
+  return (text.split('\n').find((l) => l.trim() && !l.startsWith('---') && !l.startsWith('#')) ?? '').slice(0, 160);
 }

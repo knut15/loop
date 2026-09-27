@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Manager } from '../src/manager.ts';
-import { CliAdapter, claudeSessionId, isAlive, type CliKind } from '../src/cli-adapter.ts';
+import { CliAdapter, claudeSessionId, isAlive, runDir, type CliKind } from '../src/cli-adapter.ts';
 import { MODEL } from './real-cli-config.ts';
 
 // 실제 CLI 로 복구 계약을 검증한다. 관리자 프로세스를 SIGKILL 로 죽이고, 새 관리자가 request_id 로
@@ -95,7 +95,7 @@ await scenario('C. 어댑터 기록 직후 관리자 SIGKILL', 'after_record', a
   await sleep(5000);
   const [a] = m.attempts('t1');
   const runs = countRuns(a!.request_id);
-  const spawned = existsSync(path.join(dir, 'work', a!.id, 'out.jsonl')) || isAlive(a!.request_id);
+  const spawned = existsSync(path.join(runDir(path.join(dir, 'work', a!.id)), 'out.jsonl')) || isAlive(a!.request_id);
   const ok = a!.status === 'launch_unknown' && runs === 0 && !spawned;
   return { scenario: '', ok, detail: `최종 ${a!.status}, 실제 실행 ${runs}회, 프로세스 흔적 ${spawned}` };
 });
@@ -120,7 +120,7 @@ await scenario('C. 어댑터 기록 직후 관리자 SIGKILL', 'after_record', a
     await m.recover();
     const [after] = m.attempts('t1');
     const ok = notes.length === 1 && /종료 코드 없이 사라졌거나/.test(notes[0]!) && /resolveUnknown/.test(notes[0]!)
-      && after!.status === 'launched' && !existsSync(path.join(a.workdir, 'exit_code')) && countRuns(a.request_id) <= 1;
+      && after!.status === 'launched' && !existsSync(path.join(runDir(a.workdir), 'exit_code')) && countRuns(a.request_id) <= 1;
     results.push({ scenario: 'E. 작업자 프로세스 SIGKILL', ok, detail: `알림 ${notes.length}회, 시도 ${after!.status}/${after!.last_lookup}, 다시 시작 없음 (dir: ${dir})` });
     if (notes[0]) console.log(notes[0]);
   } catch (e) {

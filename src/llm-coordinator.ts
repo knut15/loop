@@ -18,7 +18,7 @@ export const PLAN_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['kind', 'task_id', 'prompt', 'depends_on', 'blocked_by', 'expected_version', 'decision_id', 'question'],
+        required: ['kind', 'task_id', 'prompt', 'depends_on', 'blocked_by', 'expected_version', 'decision_id', 'question', 'role'],
         properties: {
           kind: { type: 'string', enum: ['add_task', 'dispatch', 'ask_user'] },
           task_id: nullableString,
@@ -28,6 +28,7 @@ export const PLAN_SCHEMA = {
           expected_version: { type: ['integer', 'null'] },
           decision_id: nullableString,
           question: nullableString,
+          role: nullableString,
         },
       },
     },
@@ -37,6 +38,7 @@ export const PLAN_SCHEMA = {
 type RawProposal = {
   kind: string; task_id: string | null; prompt: string | null; depends_on: string[] | null;
   blocked_by: string | null; expected_version: number | null; decision_id: string | null; question: string | null;
+  role?: string | null;
 };
 type RawPlan = { reasoning: string; goal_complete: boolean; proposals: RawProposal[] };
 
@@ -49,10 +51,11 @@ export function buildPrompt(s: Snapshot & { outputs: Record<string, string>; cap
       id: t.id, state: t.state, version: t.version,
       depends_on: t.depends_on ? t.depends_on.split(',') : [], blocked_by: t.blocked_by,
       attempts: s.attempts[t.id] ?? 0, max_attempts: t.max_attempts,
-      prompt: t.prompt.slice(0, 300),
+      prompt: t.prompt.slice(0, 300), role: t.role ?? null,
       result: s.outputs[t.id],
     })),
     decisions: s.decisions,
+    roles: s.roles ?? [],
     recent_history: s.history.map((h) => `${h.task_id ?? '-'} ${h.kind}: ${h.detail}`),
   };
   return `You are the coordinator of loop-ai, an orchestrator that drives coding-agent workers until a goal is done.
@@ -70,7 +73,8 @@ Rules:
 3. Dispatch: use kind "dispatch" only for ids in "runnable", at most "capacity" of them, with expected_version equal to that task's current version. Tasks you add in this plan are not runnable yet; dispatch them in the next plan.
 4. Never re-add an existing task id. If a task keeps failing (attempts near max_attempts), add a new task with a revised prompt instead of repeating the same one.
 5. Set goal_complete to true only when every task is done and their results satisfy the goal. Otherwise false.
-6. Fill unused fields with null. Keep reasoning to one or two sentences.
+6. If "roles" is not empty, set "role" on add_task to the role that fits the task best, or null. Use only listed role names.
+7. Fill unused fields with null. Keep reasoning to one or two sentences.
 
 Current state (JSON):
 ${JSON.stringify(view, null, 2)}`;
@@ -78,7 +82,10 @@ ${JSON.stringify(view, null, 2)}`;
 
 function toProposal(p: RawProposal): Proposal {
   if (p.kind === 'add_task') {
-    return { kind: 'add_task', id: p.task_id ?? '', prompt: p.prompt ?? '', dependsOn: p.depends_on ?? [], blockedBy: p.blocked_by ?? undefined };
+    return {
+      kind: 'add_task', id: p.task_id ?? '', prompt: p.prompt ?? '', dependsOn: p.depends_on ?? [],
+      blockedBy: p.blocked_by ?? undefined, role: p.role ?? undefined,
+    };
   }
   if (p.kind === 'dispatch') {
     return { kind: 'dispatch', taskId: p.task_id ?? '', expectedVersion: p.expected_version ?? -1, prompt: p.prompt ?? undefined };
