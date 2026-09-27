@@ -24,10 +24,12 @@ export type Task = {
   verify?: string | null; verify_source?: string | null;
   // 이 작업을 만들 때의 스펙 버전. goal 이 바뀌면 스펙 버전이 올라가 옛 작업을 알아볼 수 있다
   spec_version?: number | null;
+  // 이 작업이 만들거나 고칠 파일(경로 또는 glob, 쉼표로 구분). 겹치는 작업은 동시에 돌리지 않는다. 비어 있으면 제한하지 않는다
+  files?: string | null;
 };
 export type TaskOptions = {
   prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number; role?: string;
-  verify?: string; verifySource?: 'user' | 'coordinator';
+  verify?: string; verifySource?: 'user' | 'coordinator'; files?: string[];
 };
 export type Attempt = {
   id: string; task_id: string; request_id: string; workdir: string; prompt: string; status: AttemptStatus;
@@ -54,7 +56,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
   blocked_by TEXT, commit_sha TEXT,
   prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3, role TEXT,
-  verify TEXT, verify_source TEXT, spec_version INTEGER
+  verify TEXT, verify_source TEXT, spec_version INTEGER, files TEXT
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -125,6 +127,7 @@ export class Manager {
       ['tasks', 'verify', 'TEXT'],
       ['tasks', 'verify_source', 'TEXT'],
       ['tasks', 'spec_version', 'INTEGER'],
+      ['tasks', 'files', 'TEXT'],
     ];
     for (const [table, col, def] of add) {
       if (!has(table, col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
@@ -349,11 +352,11 @@ export class Manager {
   }
 
   addTask(id: string, opts: TaskOptions = {}): void {
-    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3, role, verify, verifySource = 'user' } = opts;
-    this.db.prepare(`INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role, verify, verify_source, spec_version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3, role, verify, verifySource = 'user', files = [] } = opts;
+    this.db.prepare(`INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role, verify, verify_source, spec_version, files)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts, role ?? null,
-        verify ?? null, verify ? verifySource : null, this.specVersion());
+        verify ?? null, verify ? verifySource : null, this.specVersion(), files.length ? files.join(',') : null);
     const why = [blockedBy && `결정 ${blockedBy} 대기`, dependsOn.length && `선행 ${dependsOn.join(', ')}`].filter(Boolean).join(', ');
     this.log(id, null, 'task_added', why ? `추가 (${why})` : '실행 가능으로 추가');
   }
@@ -411,12 +414,23 @@ export class Manager {
 
   // 지금 dispatch 할 수 있는 작업: ready 이고, 선행 작업이 끝났고, 시도 횟수가 남았다.
   // 병합 충돌로 되돌아간 작업은 다른 작업이 돌고 있지 않을 때만 다시 낸다 (또 충돌하지 않게 한 줄로 세운다)
+  // 돌고 있거나 통합 중인 작업과 고칠 파일이 겹치는 작업도 뺀다
   runnable(): string[] {
     const busy = this.liveCount() > 0;
     return this.tasks()
       .filter((t) => t.state === 'ready' && this.depsDone(t) && this.attemptCount(t.id) < t.max_attempts)
       .filter((t) => !(busy && this.meta(`serialize:${t.id}`) === '1'))
+      .filter((t) => !this.overlapping(t))
       .map((t) => t.id);
+  }
+
+  // t 와 고칠 파일이 겹치는, 돌고 있거나 통합 중인 작업 ID. 파일을 적지 않은 작업은 겹치지 않는 것으로 본다
+  overlapping(t: Task): string | undefined {
+    const mine = splitFiles(t.files);
+    if (!mine.length) return undefined;
+    const hit = (a: string, b: string) => a === b || path.matchesGlob(a, b) || path.matchesGlob(b, a);
+    return this.tasks().find((o) => o.id !== t.id && (o.state === 'running' || o.state === 'integrating')
+      && splitFiles(o.files).some((f) => mine.some((g) => hit(f, g))))?.id;
   }
 
   // 병합 충돌은 작업자 잘못이 아니다. 충돌로 날린 시도는 작업마다 3번까지 돌려주고, 다음 시도는 한 줄로 세운다.
@@ -448,6 +462,8 @@ export class Manager {
       if (t.state !== 'ready') throw new Rejected(`실행 가능 상태가 아니다: ${t.state}`);
       if (!this.depsDone(t)) throw new Rejected(`선행 작업이 끝나지 않았다: ${t.depends_on}`);
       if (this.attemptCount(taskId) >= t.max_attempts) throw new Rejected(`시도 횟수 상한 ${t.max_attempts}회에 닿았다`);
+      const busyWith = this.overlapping(t);
+      if (busyWith) throw new Rejected(`고칠 파일이 돌고 있는 작업 ${busyWith} 와 겹친다`);
       const id = randomUUID();
       const a: Attempt = { id, task_id: taskId, request_id: `req-${id}`, workdir: path.join(this.workRoot, id), prompt, status: 'intent', last_lookup: null };
       this.db.prepare('INSERT INTO attempts (id, task_id, request_id, workdir, prompt, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -675,3 +691,5 @@ export class Manager {
     });
   }
 }
+
+const splitFiles = (v: string | null | undefined): string[] => (v ? v.split(',').map((f) => f.trim()).filter(Boolean) : []);

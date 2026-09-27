@@ -12,7 +12,7 @@ import type { VerifyCommand, VerifyResult } from './verify.ts';
 export type Proposal =
   // prompt 를 주면 저장된 프롬프트 대신 쓴다. 선행 작업의 결과를 옮겨 담을 때 쓴다
   | { kind: 'dispatch'; taskId: string; expectedVersion: number; prompt?: string }
-  | { kind: 'add_task'; id: string; prompt: string; dependsOn: string[]; blockedBy?: string; role?: string; verify?: string }
+  | { kind: 'add_task'; id: string; prompt: string; dependsOn: string[]; blockedBy?: string; role?: string; verify?: string; files?: string[] }
   | { kind: 'ask_user'; decisionId: string; question: string }
   | { kind: 'cancel_task'; taskId: string; reason: string };
 
@@ -118,7 +118,8 @@ export type LoopResult = { status: 'done' | 'stopped' | 'max_ticks'; ticks: numb
 
 // 총괄 제안 검증 상한
 const MAX_NEW_TASKS_PER_PLAN = 10;
-const MAX_TASKS = 50;
+// 끝나지 않은 작업 수 상한. 끝난 작업은 세지 않는다 (오래 도는 프로젝트가 누적 50개에서 막히지 않게)
+const MAX_OPEN_TASKS = 50;
 const ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 // 총괄 호출이 이만큼 연속 실패하면 멈춤으로 알린다
 const COORDINATOR_FAILURE_ALERT = 3;
@@ -365,7 +366,7 @@ async function applyPlan(m: Manager, plan: Plan, capacity: number, opts: LoopOpt
         if (!ID.test(p.id)) throw new Rejected(`작업 ID 형식이 아니다: ${p.id}`);
         if (m.tasks().some((t) => t.id === p.id)) throw new Rejected(`이미 있는 작업: ${p.id}`);
         if (added >= MAX_NEW_TASKS_PER_PLAN) throw new Rejected(`한 번에 추가할 수 있는 작업은 ${MAX_NEW_TASKS_PER_PLAN}개다`);
-        if (m.tasks().length >= MAX_TASKS) throw new Rejected(`작업은 모두 ${MAX_TASKS}개까지다`);
+        if (m.tasks().filter((t) => !isFinished(t)).length >= MAX_OPEN_TASKS) throw new Rejected(`끝나지 않은 작업은 ${MAX_OPEN_TASKS}개까지다`);
         if (!p.prompt?.trim()) throw new Rejected(`프롬프트가 비었다: ${p.id}`);
         // 선행 작업은 이미 있어야 한다. 그러면 순환이 생길 수 없다
         for (const d of p.dependsOn ?? []) {
@@ -375,7 +376,8 @@ async function applyPlan(m: Manager, plan: Plan, capacity: number, opts: LoopOpt
         if (p.role && !opts.roles?.[p.role]) throw new Rejected(`없는 역할: ${p.role}`);
         if (p.verify && p.verify.length > 500) throw new Rejected(`검증 명령이 너무 길다: ${p.id}`);
         // 총괄이 제안한 검증 명령은 샌드박스 안에서만 돈다 (verify.ts)
-        m.addTask(p.id, { prompt: p.prompt, dependsOn: p.dependsOn ?? [], blockedBy: p.blockedBy, role: p.role, verify: p.verify, verifySource: 'coordinator' });
+        if (p.files?.some((f) => f.includes(','))) throw new Rejected(`파일 경로에 쉼표를 쓸 수 없다: ${p.id}`);
+        m.addTask(p.id, { prompt: p.prompt, dependsOn: p.dependsOn ?? [], blockedBy: p.blockedBy, role: p.role, verify: p.verify, verifySource: 'coordinator', files: p.files });
         added++;
       } else if (p.kind === 'ask_user') {
         if (!ID.test(p.decisionId)) throw new Rejected(`결정 ID 형식이 아니다: ${p.decisionId}`);

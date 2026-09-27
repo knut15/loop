@@ -3,6 +3,7 @@
 # 서로 독립인 작업 4개를 git 프로젝트에서 돌리고, N 마다 걸린 시간·병합 충돌·재작업 수를 센다.
 # 실제 모델을 부르므로 비용이 든다. 사용법: MODE=independent|conflict sh scripts/measure-n.sh claude|codex [N 목록]
 # conflict: 작업 4개가 모두 같은 파일(shared.txt)에 한 줄씩 덧붙인다. 병렬로 돌리면 병합 충돌이 난다
+# FILES=1: conflict 작업에 고칠 파일(--files shared.txt)을 적는다. 겹치는 작업은 동시에 돌지 않는다
 set -eu
 KIND=${1:-claude}
 shift || true
@@ -18,7 +19,7 @@ for N in $NS; do
   L review "$P" off >/dev/null
   for i in 1 2 3 4; do
     if [ "$MODE" = conflict ]; then
-      L add "$P" "f$i" --prompt "Append one line with exactly the text F$i to the end of shared.txt (create shared.txt if it does not exist). Keep existing lines. Do nothing else." --verify "grep -qx F$i shared.txt" >/dev/null
+      L add "$P" "f$i" --prompt "Append one line with exactly the text F$i to the end of shared.txt (create shared.txt if it does not exist). Keep existing lines. Do nothing else." --verify "grep -qx F$i shared.txt" ${FILES:+--files shared.txt} >/dev/null
     else
       L add "$P" "f$i" --prompt "Create a file named f$i.txt containing exactly the text F$i. Do nothing else." --verify "test -f f$i.txt" >/dev/null
     fi
@@ -36,5 +37,5 @@ for N in $NS; do
   conflicts=$(L status "$P" | grep -c '병합 충돌' || true)
   rework=$(L status "$P" | grep -c ' rework:' || true)
   accepted=$(L status "$P" | grep -c 'acceptance_passed' || true)
-  echo "[$MODE] N=$N 걸린 시간 $((end - start))초, 병합된 결과 $merged/4, 병합 충돌 $conflicts, 재작업 $rework, 인수 검증 통과 $accepted ($P)"
+  echo "[$MODE${FILES:+ files}] N=$N 걸린 시간 $((end - start))초, 병합된 결과 $merged/4, 병합 충돌 $conflicts, 재작업 $rework, 인수 검증 통과 $accepted ($P)"
 done

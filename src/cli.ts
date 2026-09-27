@@ -32,7 +32,7 @@ const USAGE = `사용법:
   loop-ai budget <dir> [--minutes <분>] [--cost-usd <달러>] [--reset]   (값 없이 부르면 현재 예산과 사용량)
   loop-ai protect <dir> [<파일 패턴> ...]   (작업자가 바꾸면 병합하지 않을 파일. 값 없이 부르면 목록을 보여 준다)
   loop-ai add <dir> <작업ID> --prompt <프롬프트> [--after <작업ID,...>] [--decision <결정ID>] [--max-attempts <n>] [--role <역할>]
-               [--verify <이 작업만 확인하는 명령>]
+               [--verify <이 작업만 확인하는 명령>] [--files <고칠 파일,...>]   (파일이 겹치는 작업은 동시에 돌리지 않는다)
   loop-ai run <dir> [--verify <작업 기본 검증>] [--accept <전체 인수 검증>] [--max <동시 실행 수>] [--interval <ms>] [--stall-minutes <분>] [--no-desktop]
   loop-ai status <dir>
   loop-ai answer <dir> <결정ID> <스펙 버전> <응답>
@@ -307,7 +307,7 @@ async function main(argv: string[]): Promise<number> {
       args: rest, allowPositionals: true,
       options: {
         prompt: { type: 'string' }, after: { type: 'string' }, decision: { type: 'string' }, 'max-attempts': { type: 'string' },
-        role: { type: 'string' }, verify: { type: 'string' },
+        role: { type: 'string' }, verify: { type: 'string' }, files: { type: 'string' },
       },
     });
     const id = positionals[0];
@@ -323,6 +323,7 @@ async function main(argv: string[]): Promise<number> {
         role: values.role,
         verify: values.verify,
         verifySource: 'user',
+        files: values.files ? values.files.split(',').map((f) => f.trim()).filter(Boolean) : undefined,
       },
     }, `작업 추가: ${id}`);
   }

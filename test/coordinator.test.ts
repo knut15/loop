@@ -47,10 +47,11 @@ const opts = (o: Partial<LoopOptions>): LoopOptions => ({ integrator: pass, maxC
 // 상태를 읽어 다음 행동을 정하는, 규칙대로 움직이는 총괄 대본
 function sensible(prompt: string): unknown {
   const state = JSON.parse(prompt.slice(prompt.indexOf('{'))) as {
-    tasks: { id: string; state: string; version: number }[]; runnable: string[]; capacity: number;
+    tasks: { id: string; state: string; version: number }[]; finished_tasks: { id: string }[]; runnable: string[]; capacity: number;
   };
-  if (state.tasks.length === 0) return plan([add('hello', 'Say HELLO'), add('world', 'Say WORLD', ['hello'])]);
-  if (state.tasks.every((t) => t.state === 'done')) return plan([], true);
+  // tasks 는 끝나지 않은 작업, finished_tasks 는 끝난 작업이다
+  if (state.tasks.length === 0 && state.finished_tasks.length === 0) return plan([add('hello', 'Say HELLO'), add('world', 'Say WORLD', ['hello'])]);
+  if (state.tasks.length === 0) return plan([], true);
   return plan(state.runnable.slice(0, state.capacity).map((id) => dispatch(id, state.tasks.find((t) => t.id === id)!.version)));
 }
 

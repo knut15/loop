@@ -62,7 +62,33 @@ test('P3. clean 은 끝난 시도만 지우고, 커밋되지 않은 변경이 �
   assert.ok(!existsSync(done.workdir) && !existsSync(`${done.workdir}.run`));
   assert.ok(existsSync(dirty.workdir), '변경이 남은 worktree 는 남긴다');
   assert.ok(existsSync(live.workdir), '살아 있는 시도는 건드리지 않는다');
-  assert.match(r.git('branch', '--list', 'loop-ai/task/*'), /loop-ai\/task\/t-done0000/, '작업 브랜치는 지우지 않는다');
+  const branches = r.git('branch', '--list', 'loop-ai/task/*');
+  assert.doesNotMatch(branches, /t-done0000/, 'loop-ai/main 에 병합된 작업 브랜치는 지운다');
+  assert.match(branches, /t-dirty000/, '남긴 worktree 의 브랜치는 그대로 둔다');
+});
+
+test('P4. loop-ai/main 에 병합되지 않은 작업 브랜치는 남기고 알린다. 작업 디렉터리는 지운다', () => {
+  const r = repo();
+  const merged = attempt(r.dir, 'merged00-a', 'succeeded');
+  const unmerged = attempt(r.dir, 'unmerge0-b', 'failed');
+  for (const a of [merged, unmerged]) r.ws.prepare(a);
+  // 두 작업 모두 커밋을 하나씩 만들고, merged 만 통합 브랜치에 합친다
+  execFileSync('sh', ['-c', 'echo m > m.txt && git add . && git commit -qm m'], { cwd: merged.workdir });
+  execFileSync('sh', ['-c', 'echo u > u.txt && git add . && git commit -qm u'], { cwd: unmerged.workdir });
+  execFileSync('git', ['merge', '-q', '--no-ff', '-m', 'merge', GitWorkspace.branchOf(merged)], { cwd: r.ws.integrationDir });
+
+  const res = cleanAttempts(r.dir, [merged, unmerged], false);
+  const branches = r.git('branch', '--list', 'loop-ai/task/*');
+  assert.doesNotMatch(branches, /t-merged00/);
+  assert.match(branches, /t-unmerge0/);
+  assert.ok(!existsSync(merged.workdir) && !existsSync(unmerged.workdir), '작업 디렉터리는 둘 다 지운다');
+  assert.equal(res.skipped.length, 1);
+  assert.match(res.skipped[0]!, /병합되지 않은 브랜치라 남겼다/);
+
+  // 다시 부르면 남은 브랜치만 다시 확인한다. 이미 지운 것은 목록에 없다
+  const again = cleanAttempts(r.dir, [merged, unmerged], true);
+  assert.equal(again.removed.length, 1);
+  assert.match(again.removed[0]!, /브랜치 loop-ai\/task\/t-unmerge0/);
 });
 
 

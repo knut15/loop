@@ -232,24 +232,32 @@ export function promote(repo: string, target: string): string {
 
 // 끝난 시도의 작업 디렉터리와 기록을 지운다. dryRun 이면 목록만 돌려준다.
 // 강제 옵션은 쓰지 않는다: 커밋되지 않은 변경이 남은 worktree 는 git 이 거절하므로 건너뛰고 알린다.
-// 작업 브랜치(loop-ai/task/*)는 지우지 않는다. 병합되지 않은 브랜치를 지우려면 강제 삭제가 필요하고, 그건 사용자가 정한다
+// 작업 브랜치(loop-ai/task/*)는 loop-ai/main 에 병합된 것만 지운다. 통합 worktree 에서 git branch -d 를 부르면
+// git 이 그 worktree 의 HEAD(loop-ai/main)에 병합됐는지 확인하고, 병합되지 않은 브랜치는 거절한다. 거절된 브랜치는 남기고 알린다
 export function cleanAttempts(repo: string | undefined, attempts: Attempt[], dryRun: boolean): { removed: string[]; skipped: string[] } {
   const removed: string[] = [];
   const skipped: string[] = [];
+  const integration = repo ? path.join(repo, '.loop-ai', 'integration') : undefined;
+  const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, stdio: ['ignore', 'ignore', 'pipe'] });
+  const hasBranch = (b: string) => {
+    try { git(['rev-parse', '--verify', '--quiet', `refs/heads/${b}`], repo!); return true; } catch { return false; }
+  };
   for (const a of attempts) {
     if (a.status === 'intent' || a.status === 'launched' || a.status === 'launch_unknown') continue; // 살아 있거나 알 수 없는 시도는 건드리지 않는다
     const run = `${a.workdir}.run`;
     const targets = [a.workdir, run].filter((p) => existsSync(p));
-    if (!targets.length) continue;
+    const branch = repo && hasBranch(GitWorkspace.branchOf(a)) ? GitWorkspace.branchOf(a) : undefined;
+    if (!targets.length && !branch) continue;
     const label = `${a.task_id}/${a.id.slice(0, 8)}`;
+    const what = [...targets, ...(branch ? [`브랜치 ${branch}`] : [])].join(', ');
     if (dryRun) {
-      removed.push(`${label}: ${targets.join(', ')}`);
+      removed.push(`${label}: ${what}`);
       continue;
     }
     if (existsSync(a.workdir)) {
       if (repo) {
         try {
-          execFileSync('git', ['worktree', 'remove', a.workdir], { cwd: repo, stdio: ['ignore', 'ignore', 'pipe'] });
+          git(['worktree', 'remove', a.workdir], repo);
         } catch {
           skipped.push(`${label}: 커밋되지 않은 변경이 있어 남겼다 (${a.workdir})`);
           continue;
@@ -259,7 +267,17 @@ export function cleanAttempts(repo: string | undefined, attempts: Attempt[], dry
       }
     }
     if (existsSync(run)) rmSync(run, { recursive: true });
-    removed.push(`${label}: ${targets.join(', ')}`);
+    if (branch) {
+      try {
+        if (!integration || !existsSync(integration)) throw new Error('통합 worktree 없음');
+        git(['branch', '-d', branch], integration);
+      } catch {
+        skipped.push(`${label}: ${INTEGRATION_BRANCH} 에 병합되지 않은 브랜치라 남겼다 (${branch})`);
+        if (targets.length) removed.push(`${label}: ${targets.join(', ')}`);
+        continue;
+      }
+    }
+    removed.push(`${label}: ${what}`);
   }
   return { removed, skipped };
 }
