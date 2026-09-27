@@ -14,13 +14,13 @@ pnpm install
 # LLM 총괄: goal 만 주면 총괄이 작업을 나누고 순서를 정한다
 pnpm loop-ai init ./my-project --adapter claude --model haiku --coordinator llm   # 또는 --adapter codex
 pnpm loop-ai goal ./my-project "만들 것을 설명한다"                                # 또는 @goal.md
-pnpm loop-ai run  ./my-project --verify "pnpm test" --max 2      # 총괄이 목표 완료라고 할 때까지 돈다
+pnpm loop-ai run  ./my-project --accept "pnpm test" --max 2      # 총괄이 목표 완료라고 하고 인수 검증이 통과할 때까지 돈다
 
 # 규칙 기반 총괄(기본값): 작업을 직접 넣고, 넣은 순서대로 돈다
 pnpm loop-ai init ./other --adapter claude
-pnpm loop-ai add  ./other a --prompt "..."
-pnpm loop-ai add  ./other b --prompt "..." --after a
-pnpm loop-ai run  ./other --verify "pnpm test"
+pnpm loop-ai add  ./other a --prompt "..." --verify "test -f a.txt"
+pnpm loop-ai add  ./other b --prompt "..." --after a --verify "test -f b.txt"
+pnpm loop-ai run  ./other --accept "pnpm test"
 pnpm loop-ai status ./my-project                                 # 멈춘 곳·작업·히스토리·다음에 할 일
 ```
 
@@ -35,6 +35,13 @@ pnpm loop-ai status ./my-project                                 # 멈춘 곳·�
 - **사용자 브랜치에는 합치지 않는다.** `loop-ai/main` 을 어디에 합칠지는 사용자가 정한다
 - 어댑터 기록(작업자 출력·종료 코드)은 작업 디렉터리 옆 `<workdir>.run/` 에 둔다. 작업 디렉터리 안에 두면 작업 변경으로 함께 병합됐다
 - `loop-ai protect <dir> <패턴>` 으로 등록한 파일(인수 테스트 등)을 작업자가 바꾸면 병합하지 않고 알린다
+
+## 작업별 검증과 인수 검증
+
+- **작업별 검증**은 통합할 때 그 작업만 확인한다. `add --verify` 로 주거나, LLM 총괄이 작업을 만들 때 제안한다. 없으면 `run --verify`(기본 명령)를 쓰고, 그것도 없으면 통과로 본다
+- **인수 검증**(`run --accept`)은 모든 작업이 done 이 된 뒤 통합 트리에서 한 번 돌린다. 통과해야 루프가 끝난다. 실패하면 알리고, LLM 총괄은 실패 출력을 보고 고칠 작업을 추가한다. 같은 상태에서는 되풀이하지 않는다
+- 두 가지를 나눈 이유: 전체 인수 테스트를 작업마다 돌리면, 먼저 끝난 작업이 혼자서는 통과할 수 없어 반려·재작업이 반복됐다. 같은 goal 을 나눈 뒤 다시 돌리니 251초·$0.63 에서 90초·$0.27 로 줄었고 재작업은 0회였다
+- **총괄이 제안한 검증 명령은 샌드박스 안에서만 돈다** (macOS `sandbox-exec`). 작업 디렉터리·임시 디렉터리 밖 쓰기와 네트워크를 막는다. 샌드박스를 쓸 수 없는 환경에서는 돌리지 않고 실패로 처리한다. 사용자가 직접 넣은 명령(`add --verify`, `run --verify`, `run --accept`)은 그대로 돈다
 
 ## 검토와 역할
 
@@ -113,6 +120,7 @@ pnpm loop-ai status ./my-project                                 # 멈춘 곳·�
 | `src/cli.ts` | `loop-ai` 명령 (`init`·`add`·`run`·`status`·`answer`·`resolve`·`grant`) |
 | `src/policy.ts` | 작업자 권한 정책. 수준별 CLI 옵션과 총괄에게 알릴 작업자 능력 |
 | `src/workspace.ts` | 작업 공간. 빈 디렉터리 또는 git worktree, 통합·검증·보호 파일 |
+| `src/verify.ts` | 검증 명령 실행. 총괄이 제안한 명령은 샌드박스에서 돌린다 |
 | `src/reviewer.ts` | 독립 검토자 |
 | `src/notify.ts` | 멈춤 알림 전달 (STATUS.md·표준 오류·데스크톱) |
 | `src/llm.ts` | LLM 을 한 번 부르고 JSON Schema 에 맞춘 결과를 받는다 (Claude Code `--json-schema`, Codex `--output-schema`) |
@@ -141,7 +149,7 @@ pnpm run typecheck
 pnpm test
 ```
 
-`pnpm test` 는 가짜 어댑터와 대본대로 응답하는 가짜 LLM, 임시 git 저장소로 시나리오 70개를 돌린다. 관리자 잠금과 SIGKILL 재시작은 실제 자식 프로세스로 확인한다.
+`pnpm test` 는 가짜 어댑터와 대본대로 응답하는 가짜 LLM, 임시 git 저장소로 시나리오 75개를 돌린다. 관리자 잠금과 SIGKILL 재시작은 실제 자식 프로세스로 확인한다.
 
 실제 CLI 로 확인하려면 아래를 돌린다. 실제 모델을 부르므로 비용이 들고, `claude` 또는 `codex` 가 로그인된 상태여야 한다.
 
@@ -154,7 +162,7 @@ pnpm run verify:cli codex    # 시나리오 4개
 
 | 항목 | 상태 |
 | --- | --- |
-| 단위·통합 테스트 | 70개 통과 |
+| 단위·통합 테스트 | 75개 통과 |
 | 복구 계약·멈춤 알림 (실제 CLI) | Claude Code 5/5, Codex 4/4 통과 (각 1회 실행) |
 | 작업자 프로세스 강제 종료 | 재시도하지 않고 한 번 알린다. 실제 CLI 로 확인 |
 | 오래 끝나지 않는 작업자 | 살아 있어도 `--stall-minutes`(기본 15분)를 넘기면 알린다. 죽이거나 재시도하지 않는다 |
@@ -163,6 +171,6 @@ pnpm run verify:cli codex    # 시나리오 4개
 | 통합 | 작업자의 작업 디렉터리에서 `--verify` 명령을 돌려 종료 코드로만 판정한다. 프로젝트 저장소와 병합하지 않으므로 "통합된 SHA 에서 검증"이 아니다 |
 | 작업 공간 | git 프로젝트면 worktree 를 넘기고 `loop-ai/main` 에 병합한다. 실제 Claude·Codex 작업자가 프로젝트 파일을 고쳐 병합됐다 |
 | 검토·역할·보호·예산·요청함 | 구현. 실제 LLM 총괄 + 검토 + 보호 + 예산을 함께 켜고 goal 을 끝까지 돌렸다 (251초, $0.63) |
-| 작업별 검증 명령 | 없음. 검증 명령이 전체 인수 테스트면 먼저 끝난 작업이 혼자 통과하지 못해 재작업이 늘었다 |
+| 작업별 검증·인수 검증 | 구현. 총괄이 작업별 검증을 제안하고 샌드박스에서 돌린다. 같은 goal 이 251초·$0.63 에서 90초·$0.27 로 줄었다 |
 | 작업자 권한 | 세 단계 정책(기본 `workspace-write`). 실제 Claude Code·Codex 작업자가 작업 디렉터리에 `hello.txt` 를 쓰고 검증을 통과했다. 밖으로 쓰려던 요청은 거절되고 알림으로 올라왔다 |
 | 알림 | 동기 콜백·`STATUS.md`·표준 오류. 전달이 실패하면 다음 tick 에 다시 보낸다 |

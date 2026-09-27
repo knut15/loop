@@ -4,3 +4,4 @@ node_modules/
 docs/diagrams/*.visual-check.*
 dist/
 *.tgz
+.loopai-sbx-probe-*

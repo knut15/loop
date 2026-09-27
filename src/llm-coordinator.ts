@@ -18,7 +18,7 @@ export const PLAN_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['kind', 'task_id', 'prompt', 'depends_on', 'blocked_by', 'expected_version', 'decision_id', 'question', 'role'],
+        required: ['kind', 'task_id', 'prompt', 'depends_on', 'blocked_by', 'expected_version', 'decision_id', 'question', 'role', 'verify'],
         properties: {
           kind: { type: 'string', enum: ['add_task', 'dispatch', 'ask_user'] },
           task_id: nullableString,
@@ -29,6 +29,7 @@ export const PLAN_SCHEMA = {
           decision_id: nullableString,
           question: nullableString,
           role: nullableString,
+          verify: nullableString,
         },
       },
     },
@@ -39,6 +40,7 @@ type RawProposal = {
   kind: string; task_id: string | null; prompt: string | null; depends_on: string[] | null;
   blocked_by: string | null; expected_version: number | null; decision_id: string | null; question: string | null;
   role?: string | null;
+  verify?: string | null;
 };
 type RawPlan = { reasoning: string; goal_complete: boolean; proposals: RawProposal[] };
 
@@ -51,11 +53,12 @@ export function buildPrompt(s: Snapshot & { outputs: Record<string, string>; cap
       id: t.id, state: t.state, version: t.version,
       depends_on: t.depends_on ? t.depends_on.split(',') : [], blocked_by: t.blocked_by,
       attempts: s.attempts[t.id] ?? 0, max_attempts: t.max_attempts,
-      prompt: t.prompt.slice(0, 300), role: t.role ?? null,
+      prompt: t.prompt.slice(0, 300), role: t.role ?? null, verify: t.verify ?? null,
       result: s.outputs[t.id],
     })),
     decisions: s.decisions,
     roles: s.roles ?? [],
+    acceptance_command: s.acceptance ?? null,
     recent_history: s.history.map((h) => `${h.task_id ?? '-'} ${h.kind}: ${h.detail}`),
   };
   return `You are the coordinator of loop-ai, an orchestrator that drives coding-agent workers until a goal is done.
@@ -74,7 +77,9 @@ Rules:
 4. Never re-add an existing task id. If a task keeps failing (attempts near max_attempts), add a new task with a revised prompt instead of repeating the same one.
 5. Set goal_complete to true only when every task is done and their results satisfy the goal. Otherwise false.
 6. If "roles" is not empty, set "role" on add_task to the role that fits the task best, or null. Use only listed role names.
-7. Fill unused fields with null. Keep reasoning to one or two sentences.
+7. Give each add_task a "verify" shell command that checks only that task's own result in the integrated project tree (for example: test -f add.sh && [ "$(sh add.sh 2 3)" = 5 ]). It must pass once this task alone is merged, even if other tasks are not done yet. It runs in a sandbox with no network. Use null if there is nothing to check.
+8. "acceptance_command" (if set) checks the whole goal after every task is done. If "recent_history" shows acceptance_failed, add tasks that fix the failure instead of repeating finished ones.
+9. Fill unused fields with null. Keep reasoning to one or two sentences.
 
 Current state (JSON):
 ${JSON.stringify(view, null, 2)}`;
@@ -84,7 +89,7 @@ function toProposal(p: RawProposal): Proposal {
   if (p.kind === 'add_task') {
     return {
       kind: 'add_task', id: p.task_id ?? '', prompt: p.prompt ?? '', dependsOn: p.depends_on ?? [],
-      blockedBy: p.blocked_by ?? undefined, role: p.role ?? undefined,
+      blockedBy: p.blocked_by ?? undefined, role: p.role ?? undefined, verify: p.verify ?? undefined,
     };
   }
   if (p.kind === 'dispatch') {

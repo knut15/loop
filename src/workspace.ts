@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Attempt, Task } from './manager.ts';
+import { runVerify, type VerifyCommand, type VerifyResult } from './verify.ts';
 
 // 작업자에게 넘길 작업 디렉터리를 만들고, 끝난 작업을 통합해 검증한다.
 //
@@ -18,31 +19,35 @@ export interface Workspace {
   // 시도의 작업 디렉터리를 만든다. 이미 있으면 그대로 둔다 (재시작 뒤 다시 불릴 수 있다)
   prepare(a: Attempt): void;
   // 끝난 시도를 통합하고 검증 명령을 돌린다
-  integrate(task: Task, a: Attempt, verify: string): IntegrationResult;
+  integrate(task: Task, a: Attempt, verify: VerifyCommand): IntegrationResult;
+  // 모든 작업이 끝난 뒤 전체 결과에 인수 검증을 돌린다 (git: 통합 트리, dir: 프로젝트 디렉터리)
+  accept(verify: VerifyCommand): VerifyResult;
   // 검토자에게 보여 줄 변경 내용 (diff 또는 파일 목록)
   changes(a: Attempt): string;
   // 총괄에게 알려 줄 작업 디렉터리 설명
   readonly description: string;
 }
 
-function sh(command: string, cwd: string): boolean {
-  try {
-    execFileSync('sh', ['-c', command], { cwd, stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export class DirWorkspace implements Workspace {
   readonly description = 'Each worker starts in its own empty directory.';
+  // 인수 검증을 돌릴 디렉터리. 빈 디렉터리 방식에는 합쳐진 결과물이 없어서 프로젝트 디렉터리에서 돌린다
+  readonly root: string;
+
+  constructor(root = process.cwd()) {
+    this.root = root;
+  }
+
+  accept(verify: VerifyCommand): VerifyResult {
+    return runVerify(verify, this.root);
+  }
 
   prepare(a: Attempt): void {
     mkdirSync(a.workdir, { recursive: true });
   }
 
-  integrate(_task: Task, a: Attempt, verify: string): IntegrationResult {
-    return { passed: sh(verify, a.workdir), sha: 'no-git', note: '작업 디렉터리 검증 (병합 없음)' };
+  integrate(_task: Task, a: Attempt, verify: VerifyCommand): IntegrationResult {
+    const r = runVerify(verify, a.workdir);
+    return { passed: r.passed, sha: 'no-git', note: `작업 디렉터리 검증 (병합 없음)${r.passed ? '' : `: ${tail(r.output)}`}` };
   }
 
   // 작업 디렉터리의 파일과 앞부분 내용. git 이 없으니 diff 대신 결과물을 그대로 보여 준다
@@ -130,7 +135,11 @@ export class GitWorkspace implements Workspace {
     return this.git(['diff', `${INTEGRATION_BRANCH}...${GitWorkspace.branchOf(a)}`]);
   }
 
-  integrate(task: Task, a: Attempt, verify: string): IntegrationResult {
+  accept(verify: VerifyCommand): VerifyResult {
+    return runVerify(verify, this.integrationDir);
+  }
+
+  integrate(task: Task, a: Attempt, verify: VerifyCommand): IntegrationResult {
     const staged = this.commitWork(a);
 
     const branch = GitWorkspace.branchOf(a);
@@ -156,9 +165,10 @@ export class GitWorkspace implements Workspace {
       return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `병합 충돌 (${branch})` };
     }
     // 통합된 트리에서 검증한다. 실패하면 병합 전으로 되돌린다
-    if (!sh(verify, d)) {
+    const v = runVerify(verify, d);
+    if (!v.passed) {
       this.abort();
-      return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `통합 트리 검증 실패 (${branch})` };
+      return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `통합 트리 검증 실패 (${branch}): ${tail(v.output)}` };
     }
     if (this.inMerge()) this.git(['commit', '-q', '-m', `loop-ai: merge ${task.id} (${a.id.slice(0, 8)})`], d);
     return { passed: true, sha: this.git(['rev-parse', 'HEAD'], d), note: staged ? `병합 (${branch})` : '변경 없음' };
@@ -176,4 +186,9 @@ export class GitWorkspace implements Workspace {
   private abort(): void {
     if (this.inMerge()) this.git(['merge', '--abort'], this.integrationDir);
   }
+}
+
+// 검증 출력의 마지막 부분. 히스토리에 남겨 총괄과 사람이 실패 이유를 보게 한다
+function tail(output: string): string {
+  return output.split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 300) || '(출력 없음)';
 }

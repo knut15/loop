@@ -18,8 +18,13 @@ export type AttemptStatus = 'intent' | 'launched' | 'launch_unknown' | 'succeede
 export type Task = {
   id: string; state: TaskState; version: number; blocked_by: string | null; commit_sha: string | null;
   prompt: string; depends_on: string; max_attempts: number; role?: string | null;
+  // 이 작업만 확인하는 검증 명령. verify_source 가 user 면 그대로, coordinator 면 샌드박스 안에서 돌린다
+  verify?: string | null; verify_source?: string | null;
 };
-export type TaskOptions = { prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number; role?: string };
+export type TaskOptions = {
+  prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number; role?: string;
+  verify?: string; verifySource?: 'user' | 'coordinator';
+};
 export type Attempt = {
   id: string; task_id: string; request_id: string; workdir: string; prompt: string; status: AttemptStatus;
   last_lookup: string | null; started_at?: number | null;
@@ -43,7 +48,8 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
   blocked_by TEXT, commit_sha TEXT,
-  prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3, role TEXT
+  prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3, role TEXT,
+  verify TEXT, verify_source TEXT
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -111,6 +117,8 @@ export class Manager {
       ['decisions', 'question', 'TEXT'],
       ['attempts', 'started_at', 'INTEGER'],
       ['tasks', 'role', 'TEXT'],
+      ['tasks', 'verify', 'TEXT'],
+      ['tasks', 'verify_source', 'TEXT'],
     ];
     for (const [table, col, def] of add) {
       if (!has(table, col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
@@ -181,7 +189,7 @@ export class Manager {
   // 작업 상태를 바꾼 기록만 센 마지막 번호. 알림·거절·총괄 실패 같은 기록은 총괄을 다시 부를 이유가 아니다
   stateSeq(): number {
     return (this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM history
-      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied', 'review_failed')`).get() as { n: number }).n;
+      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied', 'review_failed', 'acceptance_passed')`).get() as { n: number }).n;
   }
 
   attemptCounts(): Record<string, number> {
@@ -304,9 +312,11 @@ export class Manager {
   }
 
   addTask(id: string, opts: TaskOptions = {}): void {
-    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3, role } = opts;
-    this.db.prepare('INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts, role ?? null);
+    const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3, role, verify, verifySource = 'user' } = opts;
+    this.db.prepare(`INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role, verify, verify_source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts, role ?? null,
+        verify ?? null, verify ? verifySource : null);
     const why = [blockedBy && `결정 ${blockedBy} 대기`, dependsOn.length && `선행 ${dependsOn.join(', ')}`].filter(Boolean).join(', ');
     this.log(id, null, 'task_added', why ? `추가 (${why})` : '실행 가능으로 추가');
   }

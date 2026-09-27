@@ -4,6 +4,7 @@ import { Rejected, type Attempt, type Manager, type Task, type Usage } from './m
 import type { HistoryEntry } from './report.ts';
 import type { IntegrationResult, Workspace } from './workspace.ts';
 import type { Reviewer } from './reviewer.ts';
+import type { VerifyCommand, VerifyResult } from './verify.ts';
 
 // 실행 루프. tick 마다 ① 재조회·멈춤 알림 ② 검증 ③ 총괄 호출과 제안 적용을 한다.
 // 상태는 모두 Manager(SQLite)에 있으므로 루프 프로세스가 죽어도 다시 띄우면 이어서 돈다.
@@ -11,7 +12,7 @@ import type { Reviewer } from './reviewer.ts';
 export type Proposal =
   // prompt 를 주면 저장된 프롬프트 대신 쓴다. 선행 작업의 결과를 옮겨 담을 때 쓴다
   | { kind: 'dispatch'; taskId: string; expectedVersion: number; prompt?: string }
-  | { kind: 'add_task'; id: string; prompt: string; dependsOn: string[]; blockedBy?: string; role?: string }
+  | { kind: 'add_task'; id: string; prompt: string; dependsOn: string[]; blockedBy?: string; role?: string; verify?: string }
   | { kind: 'ask_user'; decisionId: string; question: string };
 
 // goalComplete: 총괄이 목표 달성 여부를 판단할 때만 채운다. 비워 두면 "모든 작업 done" 이 곧 완료다
@@ -27,6 +28,8 @@ export type Snapshot = {
   history: HistoryEntry[];
   // 쓸 수 있는 작업자 역할 이름과 한 줄 설명
   roles?: { name: string; summary: string }[];
+  // 모든 작업이 끝난 뒤 돌리는 인수 검증 명령
+  acceptance?: string;
 };
 
 export interface Coordinator {
@@ -49,9 +52,16 @@ export const inOrderCoordinator: Coordinator = {
   },
 };
 
-// 작업 공간(빈 디렉터리 또는 git worktree)에 맞게 통합하고 검증한다
-export function workspaceIntegrator(ws: Workspace, verify: string): Integrator {
-  return async (task, attempt) => ws.integrate(task, attempt, verify);
+// 작업 공간(빈 디렉터리 또는 git worktree)에 맞게 통합하고 검증한다.
+// 작업에 검증 명령이 있으면 그것을, 없으면 기본 명령(run --verify)을, 둘 다 없으면 통과로 본다.
+// 전체 인수 검증(run --accept)은 여기서 돌리지 않는다. 작업 하나로는 통과할 수 없는 경우가 있어서다
+export function workspaceIntegrator(ws: Workspace, defaultVerify?: string): Integrator {
+  return async (task, attempt) => ws.integrate(task, attempt, taskVerify(task, defaultVerify));
+}
+
+export function taskVerify(task: Task, defaultVerify?: string): VerifyCommand {
+  if (task.verify) return { command: task.verify, trusted: task.verify_source === 'user' };
+  return { command: defaultVerify ?? 'true', trusted: true };
 }
 
 // 작업자의 작업 디렉터리에서 검증 명령을 돌려 종료 코드로 판정한다. 프로젝트와 병합하지는 않는다
@@ -91,6 +101,8 @@ export type LoopOptions = {
   roles?: Record<string, string>;
   // 끝난 작업자 시도의 사용량을 읽는다. 예산 계산에 쓴다
   readUsage?: (a: Attempt) => Usage | undefined;
+  // 전체 인수 검증. 모든 작업이 done 이 된 뒤 돌리고, 통과해야 루프가 끝난다
+  accept?: { command: string; run: () => VerifyResult };
 };
 
 export type LoopResult = { status: 'done' | 'stopped' | 'max_ticks'; ticks: number };
@@ -121,8 +133,32 @@ export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
   }
 
   await consult(m, opts);
+  if (opts.accept) checkAcceptance(m, opts.accept);
   // 새로 생긴 멈춤(시도 상한, 총괄 실패 등)은 제안을 적용한 뒤에도 확인한다
   m.alertIfNeeded();
+}
+
+// 모든 작업이 done 이면 인수 검증을 돌린다. 같은 상태에서는 한 번만 돌린다.
+// 실패하면 출력을 히스토리에 남겨 총괄이 고칠 작업을 추가할 수 있게 하고, 사용자에게도 알린다
+function checkAcceptance(m: Manager, accept: NonNullable<LoopOptions['accept']>): void {
+  const tasks = m.tasks();
+  if (tasks.length === 0 || !tasks.every((t) => t.state === 'done')) return;
+  const seq = String(m.stateSeq());
+  if (m.meta('accept_seq') === seq) return;
+  const r = accept.run();
+  const out = r.output.split('\n').filter(Boolean).slice(-5).join(' | ').slice(0, 400) || '(출력 없음)';
+  if (r.passed) {
+    m.noteCoordinator('acceptance_passed', `인수 검증 통과: ${accept.command}`);
+    m.clearFlagPrefix('acceptance:');
+    m.setMeta('accept_passed', '1');
+  } else {
+    m.noteCoordinator('acceptance_failed', `인수 검증 실패: ${accept.command} → ${out}`);
+    m.setMeta('accept_passed', '0');
+    m.setFlag(`acceptance:${m.stateSeq()}`, null, `모든 작업이 끝났지만 인수 검증이 실패했다: ${out}`,
+      '실패 출력을 보고 고칠 작업을 추가한다(loop-ai add). LLM 총괄이면 총괄이 이 실패를 보고 작업을 추가한다');
+  }
+  // 기록을 남긴 뒤의 번호로 표시한다. 상태가 다시 바뀌기 전에는 같은 검증을 되풀이하지 않는다
+  m.setMeta('accept_seq', String(m.stateSeq()));
 }
 
 // 검토자 호출이 이만큼 연속 실패하면 멈춤으로 알린다
@@ -230,6 +266,7 @@ async function consult(m: Manager, opts: LoopOptions): Promise<void> {
       goal: m.goal(), tasks: m.tasks(), runnable: m.runnable(), capacity,
       attempts: m.attemptCounts(), decisions: m.decisions(), history: m.history(30),
       roles: Object.entries(opts.roles ?? {}).map(([name, text]) => ({ name, summary: summarize(text) })),
+      acceptance: opts.accept?.command,
     });
     if (!plan || !Array.isArray(plan.proposals)) throw new Error('제안 형식이 아니다');
   } catch (e) {
@@ -291,7 +328,9 @@ async function applyPlan(m: Manager, plan: Plan, capacity: number, opts: LoopOpt
         }
         if (p.blockedBy && !m.hasDecision(p.blockedBy)) throw new Rejected(`없는 결정: ${p.blockedBy}`);
         if (p.role && !opts.roles?.[p.role]) throw new Rejected(`없는 역할: ${p.role}`);
-        m.addTask(p.id, { prompt: p.prompt, dependsOn: p.dependsOn ?? [], blockedBy: p.blockedBy, role: p.role });
+        if (p.verify && p.verify.length > 500) throw new Rejected(`검증 명령이 너무 길다: ${p.id}`);
+        // 총괄이 제안한 검증 명령은 샌드박스 안에서만 돈다 (verify.ts)
+        m.addTask(p.id, { prompt: p.prompt, dependsOn: p.dependsOn ?? [], blockedBy: p.blockedBy, role: p.role, verify: p.verify, verifySource: 'coordinator' });
         added++;
       } else if (p.kind === 'ask_user') {
         if (!ID.test(p.decisionId)) throw new Rejected(`결정 ID 형식이 아니다: ${p.decisionId}`);
@@ -327,7 +366,8 @@ export async function runLoop(m: Manager, opts: LoopOptions): Promise<LoopResult
     opts.onTick?.(m);
     const tasks = m.tasks();
     const allDone = tasks.length > 0 && tasks.every((t) => t.state === 'done');
-    if (allDone && (!coordinator.decidesCompletion || m.meta('goal_complete') === '1')) return { status: 'done', ticks };
+    const accepted = !opts.accept || (m.meta('accept_passed') === '1' && m.meta('accept_seq') === String(m.stateSeq()));
+    if (allDone && accepted && (!coordinator.decidesCompletion || m.meta('goal_complete') === '1')) return { status: 'done', ticks };
     if (opts.maxTicks !== undefined && ticks >= opts.maxTicks) return { status: 'max_ticks', ticks };
     // 멈춘 작업만 남아도 끝내지 않는다. 사용자 응답·판정이 들어오면 다음 tick 에서 이어 간다
     try {

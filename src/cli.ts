@@ -28,7 +28,8 @@ const USAGE = `사용법:
   loop-ai budget <dir> [--minutes <분>] [--cost-usd <달러>] [--reset]   (값 없이 부르면 현재 예산과 사용량)
   loop-ai protect <dir> [<파일 패턴> ...]   (작업자가 바꾸면 병합하지 않을 파일. 값 없이 부르면 목록을 보여 준다)
   loop-ai add <dir> <작업ID> --prompt <프롬프트> [--after <작업ID,...>] [--decision <결정ID>] [--max-attempts <n>] [--role <역할>]
-  loop-ai run <dir> --verify <검증 명령> [--max <동시 실행 수>] [--interval <ms>] [--stall-minutes <분>] [--no-desktop]
+               [--verify <이 작업만 확인하는 명령>]
+  loop-ai run <dir> [--verify <작업 기본 검증>] [--accept <전체 인수 검증>] [--max <동시 실행 수>] [--interval <ms>] [--stall-minutes <분>] [--no-desktop]
   loop-ai status <dir>
   loop-ai answer <dir> <결정ID> <스펙 버전> <응답>
   loop-ai resolve <dir> <attemptID> succeeded|failed
@@ -65,7 +66,7 @@ function workspaceOf(dir: string, cfg: Config): Workspace {
     ws.init();
     return ws;
   }
-  return new DirWorkspace();
+  return new DirWorkspace(path.resolve(dir));
 }
 
 function loadConfig(dir: string): Config {
@@ -291,7 +292,7 @@ async function main(argv: string[]): Promise<number> {
       args: rest, allowPositionals: true,
       options: {
         prompt: { type: 'string' }, after: { type: 'string' }, decision: { type: 'string' }, 'max-attempts': { type: 'string' },
-        role: { type: 'string' },
+        role: { type: 'string' }, verify: { type: 'string' },
       },
     });
     const id = positionals[0];
@@ -305,6 +306,8 @@ async function main(argv: string[]): Promise<number> {
         dependsOn: values.after ? values.after.split(',') : [],
         maxAttempts: values['max-attempts'] ? Number(values['max-attempts']) : undefined,
         role: values.role,
+        verify: values.verify,
+        verifySource: 'user',
       },
     }, `작업 추가: ${id}`);
   }
@@ -313,11 +316,12 @@ async function main(argv: string[]): Promise<number> {
     const { values } = parseArgs({
       args: rest,
       options: {
-        verify: { type: 'string' }, max: { type: 'string', default: '2' }, interval: { type: 'string', default: '5000' },
+        verify: { type: 'string' }, accept: { type: 'string' }, max: { type: 'string', default: '2' }, interval: { type: 'string', default: '5000' },
         'stall-minutes': { type: 'string', default: '15' }, 'no-desktop': { type: 'boolean' },
       },
     });
-    if (!values.verify) throw new Error('--verify 가 필요하다. 검증 없이 done 으로 옮기지 않는다');
+    // 작업별 검증(--verify 또는 add --verify)과 전체 인수 검증(--accept) 가운데 하나는 있어야 한다
+    if (!values.verify && !values.accept) throw new Error('--verify 나 --accept 가 필요하다. 검증 없이 done 으로 옮기지 않는다');
     const lock = acquireManagerLock(p.lock); // 프로세스가 끝날 때까지 쥐고 있는다
     // STATUS.md·표준 오류에 보고서를 남기고, macOS 면 데스크톱 알림도 띄운다 (기기 밖으로는 보내지 않는다)
     const notify: Notify = makeNotify(p.status, { desktop: !values['no-desktop'] });
@@ -354,6 +358,7 @@ async function main(argv: string[]): Promise<number> {
         readUsage: (a) => (workerKind ? readUsage(workerKind, a.workdir) : undefined),
         roles: loadRoles(cfg),
         integrator: workspaceIntegrator(ws, values.verify),
+        accept: values.accept ? { command: values.accept, run: () => ws.accept({ command: values.accept!, trusted: true }) } : undefined,
         maxConcurrent: Number(values.max),
         intervalMs: Number(values.interval),
         signal: ac.signal,
