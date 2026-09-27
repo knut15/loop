@@ -141,3 +141,18 @@ test('W8. 보호 패턴에 걸리지 않는 변경은 그대로 병합된다', a
   const res = await runLoop(r.m, { integrator: workspaceIntegrator(ws, 'test -f feature.txt'), maxConcurrent: 1, intervalMs: 1, maxTicks: 8 });
   assert.equal(res.status, 'done');
 });
+
+test('W9. 병합 충돌로 날린 시도는 돌려주고, 충돌한 작업은 다른 작업이 없을 때 다시 돌려 끝까지 간다', async () => {
+  const r = repo();
+  r.adapter.onLaunch = (req) => {
+    const f = path.join(req.workdir, 'app.txt');
+    writeFileSync(f, `${readFileSync(f, 'utf8')}${req.prompt}\n`); // 같은 파일 끝에 한 줄씩 덧붙인다 → 동시에 돌면 충돌
+  };
+  for (const id of ['x', 'y', 'z']) r.m.addTask(id, { prompt: id, maxAttempts: 1 });
+  const res = await runLoop(r.m, { integrator: workspaceIntegrator(r.ws, 'true'), maxConcurrent: 3, intervalMs: 1, maxTicks: 40 });
+  assert.equal(res.status, 'done');
+  const h = r.m.history(200);
+  assert.ok(h.some((x) => x.kind === 'conflict_refund'), '충돌이 실제로 났고 시도를 돌려줬다');
+  const content = r.git('show', `${INTEGRATION_BRANCH}:app.txt`).split('\n');
+  assert.deepEqual(content.filter((l) => ['x', 'y', 'z'].includes(l)).sort(), ['x', 'y', 'z']);
+});

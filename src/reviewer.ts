@@ -4,7 +4,12 @@ import type { LlmRunner } from './llm.ts';
 // 통합 전에 불린다. 반려하면 그 의견이 다음 시도의 프롬프트에 붙는다.
 
 export type Verdict = { approve: boolean; issues: string[]; summary: string };
-export type ReviewInput = { goal: string; taskId: string; prompt: string; changes: string; output?: string };
+// evidence: 검토 전에 작업자의 작업 사본에서 돌린 작업별 검증 결과 (짧은 실험)
+// priorIssues: 두 번째 검토자에게 주는 첫 검토자의 반려 이유. 같은 작업이 연달아 반려됐을 때만 채운다
+export type ReviewInput = {
+  goal: string; taskId: string; prompt: string; changes: string; output?: string;
+  evidence?: string; priorIssues?: string;
+};
 export type Reviewer = (input: ReviewInput) => Promise<Verdict>;
 
 export const REVIEW_SCHEMA = {
@@ -26,6 +31,8 @@ Approve only if all of these hold:
 - The change does what the task asks.
 - It makes no unrelated changes.
 - It does not weaken, delete or skip tests or checks.
+loop-ai runs the task's verify command and the final acceptance test itself after your review. Do not reject only because
+the worker did not show test output; judge the change itself.
 If you reject, list concrete issues the next attempt can fix. Keep the summary to one sentence.
 
 Goal: ${i.goal || '(none)'}
@@ -33,7 +40,7 @@ Task id: ${i.taskId}
 Task prompt:
 ${i.prompt}
 
-Worker's final reply (may be empty):
+${i.evidence ? `Result of running this task's verify command on the worker's checkout (an objective check):\n${i.evidence}\n\n` : ''}${i.priorIssues ? `You are the second, tie-breaking reviewer. The first reviewer rejected this attempt with the issues below. Decide independently using the changes and the verify result; approve if the issues are not real problems.\n${i.priorIssues}\n\n` : ''}Worker's final reply (may be empty):
 ${(i.output ?? '').slice(0, 2000)}
 
 Changes:

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Attempt, Task } from './manager.ts';
 import { runVerify, type VerifyCommand, type VerifyResult } from './verify.ts';
@@ -13,7 +13,8 @@ import { runVerify, type VerifyCommand, type VerifyResult } from './verify.ts';
 //   사용자 브랜치에는 합치지 않는다. loop-ai/main 을 어디에 합칠지는 사용자가 정한다.
 
 // alert: 사람이 알아야 하는 통합 결과 (보호된 파일 변경 등). 루프가 멈춤으로 알린다
-export type IntegrationResult = { passed: boolean; sha: string; note?: string; alert?: { reason: string; next: string } };
+// conflict: 병합 충돌로 되돌렸다. 작업자 잘못이 아니라 먼저 병합된 다른 작업과 겹친 것이다
+export type IntegrationResult = { passed: boolean; sha: string; note?: string; alert?: { reason: string; next: string }; conflict?: boolean };
 
 export interface Workspace {
   // 시도의 작업 디렉터리를 만든다. 이미 있으면 그대로 둔다 (재시작 뒤 다시 불릴 수 있다)
@@ -26,10 +27,13 @@ export interface Workspace {
   changes(a: Attempt): string;
   // 총괄에게 알려 줄 작업 디렉터리 설명
   readonly description: string;
+  // 작업자에게 알려 줄 작업 디렉터리 안내. 작업 프롬프트 앞에 붙는다
+  readonly workerNote: string;
 }
 
 export class DirWorkspace implements Workspace {
   readonly description = 'Each worker starts in its own empty directory.';
+  readonly workerNote = 'Work in the current directory. It starts empty. Use relative paths.';
   // 인수 검증을 돌릴 디렉터리. 빈 디렉터리 방식에는 합쳐진 결과물이 없어서 프로젝트 디렉터리에서 돌린다
   readonly root: string;
 
@@ -71,6 +75,11 @@ export class GitWorkspace implements Workspace {
   readonly integrationDir: string;
   // 작업자가 바꾸면 안 되는 파일 패턴 (인수 테스트 등). 바꾼 변경은 병합하지 않고 알린다
   readonly protect: string[];
+  // 실제 프로젝트에서 작업자가 원래 저장소 경로를 읽으려다 거절당했다. 지금 디렉터리가 프로젝트라는 것을 알려 준다
+  readonly workerNote =
+    'Work in the current directory. It is your own checkout of the whole project (a git worktree), '
+    + 'so the project files are already here. Use relative paths such as ./SPEC.md. Paths outside it are not accessible. '
+    + 'Do not commit; loop-ai commits and merges your changes.';
   readonly description =
     'Each worker starts in its own git worktree of the project, checked out at the latest integrated state. ' +
     'Workers edit files there. loop-ai commits their changes and merges them after the verify command passes.';
@@ -162,7 +171,7 @@ export class GitWorkspace implements Workspace {
       this.git(['merge', '--no-ff', '--no-commit', branch], d);
     } catch {
       this.abort();
-      return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `병합 충돌 (${branch})` };
+      return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `병합 충돌 (${branch})`, conflict: true };
     }
     // 통합된 트리에서 검증한다. 실패하면 병합 전으로 되돌린다
     const v = runVerify(verify, d);
@@ -191,4 +200,66 @@ export class GitWorkspace implements Workspace {
 // 검증 출력의 마지막 부분. 히스토리에 남겨 총괄과 사람이 실패 이유를 보게 한다
 function tail(output: string): string {
   return output.split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 300) || '(출력 없음)';
+}
+
+// ---- 반영과 정리 (사용자가 CLI 로 부를 때만 쓴다) ----
+
+// loop-ai/main 이 사용자 브랜치보다 더 담고 있는 것
+export function integrationSummary(repo: string, base: string): { commits: string; stat: string } {
+  const git = (args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+  return {
+    commits: git(['log', '--oneline', '--no-merges', `${base}..${INTEGRATION_BRANCH}`]),
+    stat: git(['diff', '--stat', `${base}...${INTEGRATION_BRANCH}`]),
+  };
+}
+
+// loop-ai/main 을 사용자 브랜치에 병합한다. 그 브랜치가 프로젝트 디렉터리에 체크아웃돼 있고 작업 트리가 깨끗할 때만.
+// 충돌하면 merge --abort 로 되돌린다. push 는 하지 않는다
+export function promote(repo: string, target: string): string {
+  const git = (args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const current = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (current !== target) throw new Error(`${target} 가 체크아웃돼 있지 않다 (지금: ${current}). 체크아웃한 뒤 다시 부른다`);
+  const dirty = git(['status', '--porcelain', '--untracked-files=no']);
+  if (dirty) throw new Error(`작업 트리에 커밋하지 않은 변경이 있다. 정리한 뒤 다시 부른다:\n${dirty}`);
+  try {
+    git(['merge', '--no-ff', '-m', `loop-ai: ${INTEGRATION_BRANCH} 반영`, INTEGRATION_BRANCH]);
+  } catch (e) {
+    try { git(['merge', '--abort']); } catch { /* 병합 상태가 아니면 넘어간다 */ }
+    throw new Error(`병합 충돌로 되돌렸다. 직접 병합해 해결한다: git merge ${INTEGRATION_BRANCH}\n${e instanceof Error ? e.message : String(e)}`);
+  }
+  return git(['rev-parse', 'HEAD']);
+}
+
+// 끝난 시도의 작업 디렉터리와 기록을 지운다. dryRun 이면 목록만 돌려준다.
+// 강제 옵션은 쓰지 않는다: 커밋되지 않은 변경이 남은 worktree 는 git 이 거절하므로 건너뛰고 알린다.
+// 작업 브랜치(loop-ai/task/*)는 지우지 않는다. 병합되지 않은 브랜치를 지우려면 강제 삭제가 필요하고, 그건 사용자가 정한다
+export function cleanAttempts(repo: string | undefined, attempts: Attempt[], dryRun: boolean): { removed: string[]; skipped: string[] } {
+  const removed: string[] = [];
+  const skipped: string[] = [];
+  for (const a of attempts) {
+    if (a.status === 'intent' || a.status === 'launched' || a.status === 'launch_unknown') continue; // 살아 있거나 알 수 없는 시도는 건드리지 않는다
+    const run = `${a.workdir}.run`;
+    const targets = [a.workdir, run].filter((p) => existsSync(p));
+    if (!targets.length) continue;
+    const label = `${a.task_id}/${a.id.slice(0, 8)}`;
+    if (dryRun) {
+      removed.push(`${label}: ${targets.join(', ')}`);
+      continue;
+    }
+    if (existsSync(a.workdir)) {
+      if (repo) {
+        try {
+          execFileSync('git', ['worktree', 'remove', a.workdir], { cwd: repo, stdio: ['ignore', 'ignore', 'pipe'] });
+        } catch {
+          skipped.push(`${label}: 커밋되지 않은 변경이 있어 남겼다 (${a.workdir})`);
+          continue;
+        }
+      } else {
+        rmSync(a.workdir, { recursive: true });
+      }
+    }
+    if (existsSync(run)) rmSync(run, { recursive: true });
+    removed.push(`${label}: ${targets.join(', ')}`);
+  }
+  return { removed, skipped };
 }

@@ -20,7 +20,7 @@ export const PLAN_SCHEMA = {
         additionalProperties: false,
         required: ['kind', 'task_id', 'prompt', 'depends_on', 'blocked_by', 'expected_version', 'decision_id', 'question', 'role', 'verify'],
         properties: {
-          kind: { type: 'string', enum: ['add_task', 'dispatch', 'ask_user'] },
+          kind: { type: 'string', enum: ['add_task', 'dispatch', 'ask_user', 'cancel_task'] },
           task_id: nullableString,
           prompt: nullableString,
           depends_on: { type: ['array', 'null'], items: { type: 'string' } },
@@ -53,12 +53,15 @@ export function buildPrompt(s: Snapshot & { outputs: Record<string, string>; cap
       id: t.id, state: t.state, version: t.version,
       depends_on: t.depends_on ? t.depends_on.split(',') : [], blocked_by: t.blocked_by,
       attempts: s.attempts[t.id] ?? 0, max_attempts: t.max_attempts,
-      prompt: t.prompt.slice(0, 300), role: t.role ?? null, verify: t.verify ?? null,
+      prompt: t.prompt.slice(0, 300), role: t.role ?? null, verify: t.verify ?? null, spec_version: t.spec_version ?? null,
+      notes: s.notes?.[t.id],
       result: s.outputs[t.id],
     })),
     decisions: s.decisions,
     roles: s.roles ?? [],
     acceptance_command: s.acceptance ?? null,
+    last_acceptance: s.lastAcceptance ?? null,
+    spec_version: s.specVersion ?? null,
     recent_history: s.history.map((h) => `${h.task_id ?? '-'} ${h.kind}: ${h.detail}`),
   };
   return `You are the coordinator of loop-ai, an orchestrator that drives coding-agent workers until a goal is done.
@@ -71,15 +74,17 @@ How workers run:
 - A task is verified by a command after it finishes. Only verified tasks become "done".
 
 Rules:
-1. Plan: break the goal into the fewest small, self-contained tasks. Use kind "add_task" with task_id (lowercase-kebab, max 40 chars), prompt, depends_on (ids that already exist or are added earlier in this same plan).
+1. Plan: break the goal into the fewest small, self-contained tasks. Every task must create or change files toward the goal; do not add analysis-only or planning-only tasks. Every prompt must be non-empty and say exactly what to build. Use kind "add_task" with task_id (lowercase-kebab, max 40 chars), prompt, depends_on (ids that already exist or are added earlier in this same plan).
 2. Do not invent product intent. If something only the user can decide blocks progress (stack or service with cost, unclear product behaviour), use kind "ask_user" with decision_id and one clear question written in Korean, and add the dependent tasks with blocked_by set to that decision_id. At most one question per plan. Do not ask about things you can reasonably decide.
 3. Dispatch: use kind "dispatch" only for ids in "runnable", at most "capacity" of them, with expected_version equal to that task's current version. Tasks you add in this plan are not runnable yet; dispatch them in the next plan.
 4. Never re-add an existing task id. If a task keeps failing (attempts near max_attempts), add a new task with a revised prompt instead of repeating the same one.
-5. Set goal_complete to true only when every task is done and their results satisfy the goal. Otherwise false.
+5. Set goal_complete to true only when every task is done or cancelled and their results satisfy the goal. Otherwise false.
+   If a ready or blocked task is no longer needed (for example an earlier plan was replaced), cancel it with kind "cancel_task" (task_id, and the reason in "prompt"). Unfinished tasks keep the loop from finishing.
 6. If "roles" is not empty, set "role" on add_task to the role that fits the task best, or null. Use only listed role names.
 7. Give each add_task a "verify" shell command that checks only that task's own result in the integrated project tree (for example: test -f add.sh && [ "$(sh add.sh 2 3)" = 5 ]). It must pass once this task alone is merged, even if other tasks are not done yet. It runs in a sandbox with no network. Use null if there is nothing to check.
-8. "acceptance_command" (if set) checks the whole goal after every task is done. If "recent_history" shows acceptance_failed, add tasks that fix the failure instead of repeating finished ones.
-9. Fill unused fields with null. Keep reasoning to one or two sentences.
+8. Each task has "notes": attempts so far, the last reviewer rejection and the last rework reason. Use them instead of repeating a failing prompt. If a task's spec_version is older than the current "spec_version", the goal has changed since it was created; cancel or replace it if it no longer fits.
+9. "acceptance_command" (if set) checks the whole goal after every task is done. If "recent_history" shows acceptance_failed, add tasks that fix the failure instead of repeating finished ones.
+10. Fill unused fields with null. Keep reasoning to one or two sentences.
 
 Current state (JSON):
 ${JSON.stringify(view, null, 2)}`;
@@ -96,6 +101,7 @@ function toProposal(p: RawProposal): Proposal {
     return { kind: 'dispatch', taskId: p.task_id ?? '', expectedVersion: p.expected_version ?? -1, prompt: p.prompt ?? undefined };
   }
   if (p.kind === 'ask_user') return { kind: 'ask_user', decisionId: p.decision_id ?? '', question: p.question ?? '' };
+  if (p.kind === 'cancel_task') return { kind: 'cancel_task', taskId: p.task_id ?? '', reason: p.prompt ?? '' };
   // 모르는 종류는 그대로 넘겨 루프가 거절하게 한다
   return p as unknown as Proposal;
 }

@@ -12,7 +12,9 @@ import { renderReport, type Attention, type HistoryEntry } from './report.ts';
 export class Rejected extends Error {}
 export class SimulatedCrash extends Error {}
 
-export type TaskState = 'ready' | 'blocked' | 'running' | 'integrating' | 'done';
+// cancelled: 더는 필요 없어 치운 작업. 완료 판정에서는 끝난 것으로 본다
+export type TaskState = 'ready' | 'blocked' | 'running' | 'integrating' | 'done' | 'cancelled';
+export const isFinished = (t: { state: string }) => t.state === 'done' || t.state === 'cancelled';
 export type AttemptStatus = 'intent' | 'launched' | 'launch_unknown' | 'succeeded' | 'failed';
 
 export type Task = {
@@ -20,6 +22,8 @@ export type Task = {
   prompt: string; depends_on: string; max_attempts: number; role?: string | null;
   // 이 작업만 확인하는 검증 명령. verify_source 가 user 면 그대로, coordinator 면 샌드박스 안에서 돌린다
   verify?: string | null; verify_source?: string | null;
+  // 이 작업을 만들 때의 스펙 버전. goal 이 바뀌면 스펙 버전이 올라가 옛 작업을 알아볼 수 있다
+  spec_version?: number | null;
 };
 export type TaskOptions = {
   prompt?: string; blockedBy?: string; dependsOn?: string[]; maxAttempts?: number; role?: string;
@@ -36,6 +40,7 @@ export type Request =
   | { kind: 'answer'; id: string; version: number; answer: string }
   | { kind: 'resolve'; attemptId: string; verdict: 'succeeded' | 'failed' }
   | { kind: 'grant'; taskId: string; n: number }
+  | { kind: 'cancel'; taskId: string; reason: string }
   | { kind: 'budget'; maxMinutes?: number; maxCostUsd?: number; reset?: boolean };
 export type Usage = { costUsd?: number | null; inputTokens?: number; outputTokens?: number };
 export type UsageTotals = { costUsd: number; costKnown: number; costUnknown: number; inputTokens: number; outputTokens: number };
@@ -49,7 +54,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
   blocked_by TEXT, commit_sha TEXT,
   prompt TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '', max_attempts INTEGER NOT NULL DEFAULT 3, role TEXT,
-  verify TEXT, verify_source TEXT
+  verify TEXT, verify_source TEXT, spec_version INTEGER
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -119,6 +124,7 @@ export class Manager {
       ['tasks', 'role', 'TEXT'],
       ['tasks', 'verify', 'TEXT'],
       ['tasks', 'verify_source', 'TEXT'],
+      ['tasks', 'spec_version', 'INTEGER'],
     ];
     for (const [table, col, def] of add) {
       if (!has(table, col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
@@ -176,9 +182,39 @@ export class Manager {
     return this.meta('goal') ?? '';
   }
 
+  // goal 을 바꾸면 스펙 버전을 올린다. 옛 버전에서 만든 작업과 옛 스펙에 대한 사용자 응답을 알아볼 수 있게 된다
   setGoal(goal: string): void {
+    const before = this.meta('goal');
     this.setMeta('goal', goal);
-    this.log(null, null, 'goal_set', goal.split('\n')[0]!.slice(0, 120));
+    if (before !== undefined && before !== goal) {
+      this.setSpecVersion(this.specVersion() + 1);
+      this.log(null, null, 'goal_changed', `스펙 버전 ${this.specVersion()}: ${goal.split('\n')[0]!.slice(0, 120)}`);
+    } else {
+      this.log(null, null, 'goal_set', goal.split('\n')[0]!.slice(0, 120));
+    }
+  }
+
+  // 총괄에게 넘길 작업별 요약. 최근 히스토리 창에서 빠진 뒤에도 작업마다 마지막 판단 근거가 남게 한다
+  taskNotes(): Record<string, { attempts: number; lastRejection?: string; lastRework?: string; cancelled?: string }> {
+    const out: Record<string, { attempts: number; lastRejection?: string; lastRework?: string; cancelled?: string }> = {};
+    const counts = this.attemptCounts();
+    for (const t of this.tasks()) out[t.id] = { attempts: counts[t.id] ?? 0 };
+    const rows = this.db.prepare(`SELECT task_id, kind, detail FROM history WHERE task_id IS NOT NULL
+      AND kind IN ('review_rejected', 'rework', 'cancelled') ORDER BY seq`).all() as { task_id: string; kind: string; detail: string }[];
+    for (const r of rows) {
+      const n = out[r.task_id];
+      if (!n) continue;
+      if (r.kind === 'review_rejected') n.lastRejection = r.detail.slice(0, 300);
+      if (r.kind === 'rework') n.lastRework = r.detail.slice(0, 300);
+      if (r.kind === 'cancelled') n.cancelled = r.detail.slice(0, 200);
+    }
+    return out;
+  }
+
+  // 가장 최근 인수 검증 결과
+  lastAcceptance(): string | undefined {
+    const r = this.db.prepare(`SELECT detail FROM history WHERE kind IN ('acceptance_passed', 'acceptance_failed') ORDER BY seq DESC LIMIT 1`).get() as { detail: string } | undefined;
+    return r?.detail;
   }
 
   // 마지막 히스토리 번호. 총괄은 이 값이 바뀌었을 때만 다시 부른다
@@ -226,6 +262,7 @@ export class Manager {
         else if (r.kind === 'answer') this.answerDecision(r.id, r.version, r.answer);
         else if (r.kind === 'resolve') this.resolveUnknown(r.attemptId, r.verdict);
         else if (r.kind === 'grant') this.grantAttempts(r.taskId, r.n);
+        else if (r.kind === 'cancel') this.cancelTask(r.taskId, r.reason);
         else if (r.kind === 'budget') this.setBudget(r);
         else throw new Error(`모르는 요청: ${(r as { kind: string }).kind}`);
       } catch (e) {
@@ -313,10 +350,10 @@ export class Manager {
 
   addTask(id: string, opts: TaskOptions = {}): void {
     const { prompt = '', blockedBy, dependsOn = [], maxAttempts = 3, role, verify, verifySource = 'user' } = opts;
-    this.db.prepare(`INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role, verify, verify_source)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    this.db.prepare(`INSERT INTO tasks (id, state, blocked_by, prompt, depends_on, max_attempts, role, verify, verify_source, spec_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, blockedBy ? 'blocked' : 'ready', blockedBy ?? null, prompt, dependsOn.join(','), maxAttempts, role ?? null,
-        verify ?? null, verify ? verifySource : null);
+        verify ?? null, verify ? verifySource : null, this.specVersion());
     const why = [blockedBy && `결정 ${blockedBy} 대기`, dependsOn.length && `선행 ${dependsOn.join(', ')}`].filter(Boolean).join(', ');
     this.log(id, null, 'task_added', why ? `추가 (${why})` : '실행 가능으로 추가');
   }
@@ -343,6 +380,15 @@ export class Manager {
     return this.db.prepare(`SELECT * FROM attempts WHERE task_id = ? AND status = 'succeeded' ORDER BY rowid DESC LIMIT 1`).get(taskId) as Attempt | undefined;
   }
 
+  // 더는 필요 없는 작업을 치운다. 돌고 있거나 통합 중이거나 끝난 작업은 치울 수 없다.
+  // 실제 프로젝트에서 총괄이 먼저 만든 작업들이 ready 로 남아 완료 판정을 막았다
+  cancelTask(taskId: string, reason: string): void {
+    const t = this.task(taskId);
+    if (t.state !== 'ready' && t.state !== 'blocked') throw new Rejected(`취소할 수 없는 상태다: ${taskId} (${t.state})`);
+    this.bump(taskId, 'cancelled');
+    this.log(taskId, null, 'cancelled', reason.slice(0, 200) || '취소');
+  }
+
   // 시도 횟수 상한에 닿은 작업에 기회를 더 준다. 사람이 원인을 확인한 뒤 부른다
   grantAttempts(taskId: string, n: number): void {
     this.db.prepare('UPDATE tasks SET max_attempts = max_attempts + ? WHERE id = ?').run(n, taskId);
@@ -355,15 +401,34 @@ export class Manager {
     return t;
   }
 
+  allAttempts(): Attempt[] {
+    return this.db.prepare('SELECT * FROM attempts ORDER BY rowid').all() as Attempt[];
+  }
+
   attempts(taskId: string): Attempt[] {
     return this.db.prepare('SELECT * FROM attempts WHERE task_id = ? ORDER BY rowid').all(taskId) as Attempt[];
   }
 
-  // 지금 dispatch 할 수 있는 작업: ready 이고, 선행 작업이 끝났고, 시도 횟수가 남았다
+  // 지금 dispatch 할 수 있는 작업: ready 이고, 선행 작업이 끝났고, 시도 횟수가 남았다.
+  // 병합 충돌로 되돌아간 작업은 다른 작업이 돌고 있지 않을 때만 다시 낸다 (또 충돌하지 않게 한 줄로 세운다)
   runnable(): string[] {
+    const busy = this.liveCount() > 0;
     return this.tasks()
       .filter((t) => t.state === 'ready' && this.depsDone(t) && this.attemptCount(t.id) < t.max_attempts)
+      .filter((t) => !(busy && this.meta(`serialize:${t.id}`) === '1'))
       .map((t) => t.id);
+  }
+
+  // 병합 충돌은 작업자 잘못이 아니다. 충돌로 날린 시도는 작업마다 3번까지 돌려주고, 다음 시도는 한 줄로 세운다.
+  // 같은 파일을 고치는 작업 4개를 동시에 돌렸더니 한 작업이 충돌만으로 시도 상한에 닿았다
+  noteConflict(taskId: string): void {
+    const n = Number(this.meta(`conflicts:${taskId}`) ?? 0) + 1;
+    this.setMeta(`conflicts:${taskId}`, String(n));
+    this.setMeta(`serialize:${taskId}`, '1');
+    if (n <= 3) {
+      this.db.prepare('UPDATE tasks SET max_attempts = max_attempts + 1 WHERE id = ?').run(taskId);
+      this.log(taskId, null, 'conflict_refund', `병합 충돌 ${n}회째: 시도 1회를 돌려주고, 다른 작업이 없을 때 다시 낸다`);
+    }
   }
 
   private bump(taskId: string, state: TaskState): void {

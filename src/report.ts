@@ -50,7 +50,7 @@ export function renderReport({ at, tasks, runnable, attention, history, usage, b
   const integrating = tasks.filter((t) => t.state === 'integrating').map((t) => t.id);
   if (ready.length) next.push(`실행 가능한 작업을 dispatch 한다: ${ready.join(', ')}`);
   if (integrating.length) next.push(`통합·인수 검증을 돌린다: ${integrating.join(', ')}`);
-  if (next.length === 0) next.push(tasks.length && tasks.every((t) => t.state === 'done') ? '모든 작업이 끝났다' : '실행 중인 작업이 끝나기를 기다린다');
+  if (next.length === 0) next.push(tasks.length && tasks.every((t) => t.state === 'done' || t.state === 'cancelled') ? '모든 작업이 끝났다' : '실행 중인 작업이 끝나기를 기다린다');
   next.forEach((n, i) => lines.push(`${i + 1}. ${n}`));
 
   return lines.join('\n');

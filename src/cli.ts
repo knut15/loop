@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import type { Adapter } from './adapter.ts';
@@ -7,12 +8,15 @@ import { CliAdapter, readDenials, readOutput, readUsage, type CliKind } from './
 import { capability, DEFAULT_ACCESS, WORKER_ACCESS, type WorkerAccess } from './policy.ts';
 import { FakeAdapter } from './fake-adapter.ts';
 import { acquireManagerLock, LockHeldError } from './lock.ts';
-import { inOrderCoordinator, runLoop, workspaceIntegrator, type Coordinator } from './loop.ts';
-import { DirWorkspace, GitWorkspace, INTEGRATION_BRANCH, type Workspace } from './workspace.ts';
+import { inOrderCoordinator, runLoop, taskVerify, workspaceIntegrator, type Coordinator } from './loop.ts';
+import { runVerify } from './verify.ts';
+import { cleanAttempts, DirWorkspace, GitWorkspace, integrationSummary, INTEGRATION_BRANCH, promote, type Workspace } from './workspace.ts';
 import { cliRunner } from './llm.ts';
 import { llmCoordinator } from './llm-coordinator.ts';
 import { llmReviewer } from './reviewer.ts';
 import { makeNotify } from './notify.ts';
+import { plistPath, renderPlist, serviceLabel } from './service.ts';
+import { execFileSync } from 'node:child_process';
 import { Manager, type ManagerOptions, type Notify, type Request } from './manager.ts';
 
 // 프로젝트마다 <dir>/.loop-ai 아래에 상태 DB·어댑터 기록·잠금·보고서를 둔다. 잠금 경로는 여기로 고정한다.
@@ -33,7 +37,14 @@ const USAGE = `사용법:
   loop-ai status <dir>
   loop-ai answer <dir> <결정ID> <스펙 버전> <응답>
   loop-ai resolve <dir> <attemptID> succeeded|failed
-  loop-ai grant <dir> <작업ID> [<횟수>]`;
+  loop-ai grant <dir> <작업ID> [<횟수>]
+  loop-ai service <dir> plist|install|uninstall|status [-- <run 인자 ...>]
+               (macOS launchd 로 run 을 띄운다. 비정상 종료 때만 다시 띄우고, 정상 완료면 멈춘다)
+  loop-ai summary <dir> [--base <브랜치>]   (loop-ai/main 이 사용자 브랜치보다 더 담은 커밋·파일)
+  loop-ai promote <dir> [--into <브랜치>]   (loop-ai/main 을 체크아웃된 사용자 브랜치에 병합한다. push 는 하지 않는다)
+  loop-ai clean <dir> [--yes]               (끝난 시도의 worktree·기록을 지운다. --yes 없이는 목록만)
+  loop-ai sandbox <dir> [allow <경로> ...]  (총괄이 제안한 검증 명령의 샌드박스에서 쓰기를 더 허용할 경로)
+  loop-ai cancel <dir> <작업ID> [<이유>]   (더는 필요 없는 ready·blocked 작업을 치운다)`;
 
 type Config = {
   adapter: CliKind | 'fake'; model?: string;
@@ -49,6 +60,8 @@ type Config = {
   review?: { enabled: boolean; cli?: CliKind; model?: string };
   // 역할 이름 → 지침 파일 경로. dispatch 때 파일 내용을 작업 프롬프트 앞에 붙인다
   roles?: Record<string, string>;
+  // 총괄이 제안한 검증 명령의 샌드박스에서 쓰기를 더 허용할 경로 (테스트 도구 캐시 등)
+  sandboxAllow?: string[];
 };
 
 function loadRoles(cfg: Config): Record<string, string> {
@@ -82,7 +95,9 @@ const paths = (dir: string) => {
     adapter: path.join(root, 'adapter.json'),
     lock: path.join(root, 'manager.lock'),
     status: path.join(root, 'STATUS.md'),
-    work: path.join(root, 'work'),
+    // 작업자의 작업 디렉터리는 프로젝트 밖에 둔다. 프로젝트 안(.loop-ai/work)에 두었더니 작업자가 경로를 보고
+    // 상위 디렉터리를 프로젝트로 짐작해 원래 저장소 파일을 읽으려다 거절당했다
+    work: path.join(homedir(), '.loop-ai', 'work', serviceLabel(dir)),
   };
 };
 
@@ -322,6 +337,10 @@ async function main(argv: string[]): Promise<number> {
     });
     // 작업별 검증(--verify 또는 add --verify)과 전체 인수 검증(--accept) 가운데 하나는 있어야 한다
     if (!values.verify && !values.accept) throw new Error('--verify 나 --accept 가 필요하다. 검증 없이 done 으로 옮기지 않는다');
+    // LLM 총괄은 작업별 검증을 스스로 제안해서 느슨할 수 있다. 목표 전체를 확인하는 인수 검증을 반드시 둔다
+    if (loadConfig(dir).coordinator?.kind === 'llm' && !values.accept) {
+      throw new Error('LLM 총괄을 쓸 때는 --accept 가 필요하다. 총괄이 제안한 작업별 검증만으로는 목표 전체를 확인할 수 없다');
+    }
     const lock = acquireManagerLock(p.lock); // 프로세스가 끝날 때까지 쥐고 있는다
     // STATUS.md·표준 오류에 보고서를 남기고, macOS 면 데스크톱 알림도 띄운다 (기기 밖으로는 보내지 않는다)
     const notify: Notify = makeNotify(p.status, { desktop: !values['no-desktop'] });
@@ -354,10 +373,12 @@ async function main(argv: string[]): Promise<number> {
           ? llmReviewer(cliRunner(cfg.review.cli ?? (cfg.adapter as CliKind), cfg.review.model ?? cfg.model, undefined, (u) => m.recordUsage('reviewer', u)))
           : undefined,
         changes: (a) => ws.changes(a),
+        preCheck: (t, a) => runVerify(taskVerify(t, values.verify, cfg.sandboxAllow), a.workdir),
         readOutput: (a) => (workerKind ? readOutput(workerKind, a.workdir) : undefined),
         readUsage: (a) => (workerKind ? readUsage(workerKind, a.workdir) : undefined),
         roles: loadRoles(cfg),
-        integrator: workspaceIntegrator(ws, values.verify),
+        workerNote: ws.workerNote,
+        integrator: workspaceIntegrator(ws, values.verify, cfg.sandboxAllow),
         accept: values.accept ? { command: values.accept, run: () => ws.accept({ command: values.accept!, trusted: true }) } : undefined,
         maxConcurrent: Number(values.max),
         intervalMs: Number(values.interval),
@@ -393,6 +414,106 @@ async function main(argv: string[]): Promise<number> {
     const [attemptId, verdict] = rest;
     if (!attemptId || (verdict !== 'succeeded' && verdict !== 'failed')) throw new Error('resolve <dir> <attemptID> succeeded|failed');
     return submit(dir, { kind: 'resolve', attemptId, verdict }, `판정 기록: ${attemptId} → ${verdict}`);
+  }
+
+  if (cmd === 'service') {
+    const [action, ...more] = rest;
+    const sep = more.indexOf('--');
+    const runArgs = sep >= 0 ? more.slice(sep + 1) : [];
+    const plist = plistPath(dir);
+    const label = serviceLabel(dir);
+    const uid = process.getuid?.() ?? 0;
+    if (action === 'plist' || action === 'install') {
+      if (!runArgs.includes('--verify') && !runArgs.includes('--accept')) throw new Error('run 인자에 --verify 나 --accept 가 필요하다. 예: service <dir> install -- --accept "pnpm test"');
+      const xml = renderPlist({ projectDir: dir, runArgs, node: process.execPath, cli: path.resolve(process.argv[1]!), pathEnv: process.env.PATH ?? '/usr/bin:/bin' });
+      if (action === 'plist') {
+        process.stdout.write(xml);
+        return 0;
+      }
+      // 설치는 사용자 환경을 바꾸는 일이다 (~/Library/LaunchAgents 에 쓰고 launchd 에 등록). 사용자가 직접 부를 때만 한다
+      mkdirSync(path.dirname(plist), { recursive: true });
+      writeFileSync(plist, xml);
+      execFileSync('launchctl', ['bootstrap', `gui/${uid}`, plist], { stdio: 'inherit' });
+      console.log(`등록: ${label} (${plist}). 로그: ${path.join(paths(dir).root, 'service.log')}`);
+      return 0;
+    }
+    if (action === 'uninstall') {
+      try {
+        execFileSync('launchctl', ['bootout', `gui/${uid}/${label}`], { stdio: 'inherit' });
+      } catch { /* 이미 내려가 있으면 넘어간다 */ }
+      console.log(`해제: ${label}. 설정 파일은 남겨 두었다: ${plist}`);
+      return 0;
+    }
+    if (action === 'status') {
+      try {
+        const out = execFileSync('launchctl', ['print', `gui/${uid}/${label}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        console.log(out.split('\n').filter((l) => /state =|pid =|last exit code|runs =/.test(l)).map((l) => l.trim()).join('\n'));
+      } catch {
+        console.log(`등록되지 않았다: ${label}`);
+      }
+      return 0;
+    }
+    throw new Error('service <dir> plist|install|uninstall|status');
+  }
+
+  if (cmd === 'summary' || cmd === 'promote') {
+    const cfg = loadConfig(dir);
+    if (cfg.workspace !== 'git') throw new Error(`${cmd} 는 git 작업 공간에서만 쓴다`);
+    const { values } = parseArgs({ args: rest, options: { base: { type: 'string' }, into: { type: 'string' } } });
+    const repo = path.resolve(dir);
+    const branch = values.into ?? values.base ?? execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    if (cmd === 'summary') {
+      const s = integrationSummary(repo, branch);
+      console.log(`${INTEGRATION_BRANCH} 이 ${branch} 보다 더 담은 커밋:\n${s.commits || '(없음)'}\n\n파일 변경:\n${s.stat || '(없음)'}`);
+      return 0;
+    }
+    const sha = promote(repo, branch);
+    console.log(`${INTEGRATION_BRANCH} 를 ${branch} 에 병합했다: ${sha.slice(0, 7)}. push 는 하지 않았다`);
+    return 0;
+  }
+
+  if (cmd === 'clean') {
+    const yes = rest.includes('--yes');
+    const cfg = loadConfig(dir);
+    // 루프가 돌고 있으면 정리하지 않는다. 쓰고 있는 작업 디렉터리를 지울 수 있다
+    let lock;
+    try {
+      lock = acquireManagerLock(p.lock);
+    } catch (e) {
+      if (e instanceof LockHeldError) throw new Error('루프가 실행 중이다. 멈춘 뒤 정리한다');
+      throw e;
+    }
+    const m = open(dir);
+    try {
+      const r = cleanAttempts(cfg.workspace === 'git' ? path.resolve(dir) : undefined, m.allAttempts(), !yes);
+      if (r.removed.length) console.log(r.removed.join('\n'));
+      if (r.skipped.length) console.log(`남긴 것:\n${r.skipped.join('\n')}`);
+      console.log(yes ? `정리함: ${r.removed.length}건, 남김: ${r.skipped.length}건` : `정리할 것: ${r.removed.length}건. 지우려면 --yes 를 붙인다`);
+    } finally {
+      m.close();
+      lock.close();
+    }
+    return 0;
+  }
+
+  if (cmd === 'sandbox') {
+    const cfg = loadConfig(dir);
+    const [action, ...more] = rest;
+    if (!action) {
+      console.log((cfg.sandboxAllow ?? []).join('\n') || '(추가로 허용한 경로 없음)');
+      return 0;
+    }
+    if (action !== 'allow' || more.length === 0) throw new Error('sandbox <dir> allow <경로> ...');
+    const sandboxAllow = [...new Set([...(cfg.sandboxAllow ?? []), ...more.map((x) => path.resolve(x))])];
+    writeFileSync(p.config, JSON.stringify({ ...cfg, sandboxAllow }, null, 2));
+    console.log(`샌드박스 쓰기 허용 경로: ${sandboxAllow.join(', ')}. run 을 다시 띄우면 적용된다`);
+    return 0;
+  }
+
+  if (cmd === 'cancel') {
+    const [taskId, ...why] = rest;
+    if (!taskId) throw new Error('cancel <dir> <작업ID> [<이유>]');
+    return submit(dir, { kind: 'cancel', taskId, reason: why.join(' ') || '사용자가 취소' }, `작업 취소: ${taskId}`);
   }
 
   if (cmd === 'grant') {
