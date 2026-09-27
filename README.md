@@ -26,6 +26,22 @@ pnpm loop-ai status ./my-project                                 # 멈춘 곳·�
 
 `run` 은 tick 마다 재조회와 멈춤 알림, 검증, 동시 실행 상한 안의 dispatch 를 한다. 멈춘 작업만 남아도 끝나지 않고 기다린다. 다른 터미널에서 `answer`(사용자 결정), `resolve`(멈춘 시도 판정), `grant`(시도 횟수 추가)를 입력하면 다음 tick 에서 이어 간다. 상태와 보고서는 `<프로젝트>/.loop-ai/` 에 있다(`state.db`, `STATUS.md`, `manager.lock`).
 
+## 작업자 권한
+
+작업자를 띄울 때 권한을 프롬프트로 부탁하지 않고, 각 CLI 가 직접 강제하는 옵션으로 막는다. `loop-ai init --worker-access` 로 정하고 `loop-ai policy <dir> <수준>` 으로 바꾼다. 바꾼 기록은 히스토리에 남는다.
+
+| 수준 | Claude Code | Codex | 작업자가 할 수 있는 것 |
+| --- | --- | --- | --- |
+| `read-only` | `--restricted`, 읽기 도구만 | `-s read-only` | 읽고 텍스트로만 결과를 돌려준다 |
+| `workspace-write` (기본) | `--restricted --permission-mode dontAsk`, 파일 도구만 | `-s workspace-write` | 자기 작업 디렉터리 안에서만 파일을 쓴다. Claude 는 셸이 없고, Codex 는 샌드박스 안에서 셸을 쓰되 네트워크와 밖으로 쓰기가 막힌다 |
+| `full` | `bypassPermissions` | 샌드박스 해제 | 제한 없음. 사용자가 직접 켤 때만 쓴다 |
+
+기본값이 `workspace-write` 인 이유는 설치·push·삭제·외부 전송에 사용자 승인이 필요하기 때문이다. 이 수준에서는 네트워크와 작업 디렉터리 밖 쓰기가 CLI 수준에서 막혀서 그런 행동이 일어날 수 없다.
+
+작업자가 권한 밖 요청을 거절당하면 멈춤 보고서로 알린다. 작업마다 한 번 알리고, 그 작업이 done 이 되면 내린다. 거절 목록은 Claude 결과의 `permission_denials` 에서 읽는다. Codex 샌드박스 거절은 명령 실패로만 보여서 아직 잡지 못한다.
+
+확인한 것: Claude `--restricted` 는 작업 디렉터리 안 쓰기는 허용하고 밖 쓰기는 거절했으며, 셸 도구는 아예 없었다. Codex `workspace-write` 는 작업 디렉터리와 임시 디렉터리 밖 쓰기를 `operation not permitted` 로 막았고, 네트워크 요청(`curl`)도 실패했다. 임시 디렉터리 쓰기는 허용된다.
+
 ## LLM 총괄
 
 `--coordinator llm` 이면 상태가 바뀔 때마다 LLM 을 한 번 부른다. goal, 작업 상태, 끝난 작업의 결과 일부, 최근 히스토리, 결정과 응답을 넘기고 JSON Schema 에 맞춘 계획을 받는다. 도구를 끄고 빈 임시 디렉터리에서 부르므로 총괄은 판단만 한다.
@@ -68,6 +84,7 @@ pnpm loop-ai status ./my-project                                 # 멈춘 곳·�
 | `src/lock.ts` | 관리자를 하나만 띄운다. 별도 파일에 SQLite `EXCLUSIVE` 잠금을 걸어, 프로세스가 죽으면 OS 가 푼다 |
 | `src/loop.ts` | 실행 루프. `Coordinator`·`Integrator` 인터페이스와 기본 구현 |
 | `src/cli.ts` | `loop-ai` 명령 (`init`·`add`·`run`·`status`·`answer`·`resolve`·`grant`) |
+| `src/policy.ts` | 작업자 권한 정책. 수준별 CLI 옵션과 총괄에게 알릴 작업자 능력 |
 | `src/llm.ts` | LLM 을 한 번 부르고 JSON Schema 에 맞춘 결과를 받는다 (Claude Code `--json-schema`, Codex `--output-schema`) |
 | `src/llm-coordinator.ts` | LLM 총괄. 프롬프트와 계획 스키마 |
 | `src/report.ts` | 상태 보고서. 멈춘 곳·작업·히스토리·다음에 할 일 |
@@ -85,7 +102,7 @@ pnpm run typecheck
 pnpm test
 ```
 
-`pnpm test` 는 가짜 어댑터와 대본대로 응답하는 가짜 LLM 으로 장애·알림·루프·총괄·CLI 시나리오 42개를 돌린다. 관리자 잠금과 SIGKILL 재시작은 실제 자식 프로세스로 확인한다.
+`pnpm test` 는 가짜 어댑터와 대본대로 응답하는 가짜 LLM 으로 장애·알림·루프·총괄·권한·CLI 시나리오 46개를 돌린다. 관리자 잠금과 SIGKILL 재시작은 실제 자식 프로세스로 확인한다.
 
 실제 CLI 로 확인하려면 아래를 돌린다. 실제 모델을 부르므로 비용이 들고, `claude` 또는 `codex` 가 로그인된 상태여야 한다.
 
@@ -98,7 +115,7 @@ pnpm run verify:cli codex    # 시나리오 4개
 
 | 항목 | 상태 |
 | --- | --- |
-| 복구 계약·멈춤 알림·루프·총괄 (가짜 어댑터·가짜 LLM) | 42개 테스트 통과 |
+| 복구 계약·멈춤 알림·루프·총괄·권한 (가짜 어댑터·가짜 LLM) | 46개 테스트 통과 |
 | 복구 계약·멈춤 알림 (실제 CLI) | Claude Code 5/5, Codex 4/4 통과 (각 1회 실행) |
 | 작업자 프로세스 강제 종료 | 재시도하지 않고 한 번 알린다. 실제 CLI 로 확인 |
 | 오래 끝나지 않는 작업자 | 살아 있어도 `--stall-minutes`(기본 15분)를 넘기면 알린다. 죽이거나 재시도하지 않는다 |
@@ -106,5 +123,5 @@ pnpm run verify:cli codex    # 시나리오 4개
 | 총괄 | 규칙 기반(기본)과 LLM 총괄. 실제 Claude haiku 총괄로 goal 을 작업 2개로 나누고, 앞 작업 결과를 뒤 작업 프롬프트에 옮겨 끝까지 돌렸다 |
 | 통합 | 작업자의 작업 디렉터리에서 `--verify` 명령을 돌려 종료 코드로만 판정한다. 프로젝트 저장소와 병합하지 않으므로 "통합된 SHA 에서 검증"이 아니다 |
 | 작업 디렉터리 | 작업자는 빈 디렉터리에서 돈다. 프로젝트 worktree 를 넘겨주는 기능은 없다 |
-| 작업자 권한 | Claude 작업자는 `--permission-mode dontAsk` 로 띄운다. 권한이 필요한 도구 요청은 기다리지 않고 거절된다(기다리면 출력 없이 멈췄다). 그래서 지금 작업자는 파일을 고치지 못하고 결과를 텍스트로만 돌려준다. 권한 정책은 아직 정하지 않았다 |
+| 작업자 권한 | 세 단계 정책(기본 `workspace-write`). 실제 Claude Code·Codex 작업자가 작업 디렉터리에 `hello.txt` 를 쓰고 검증을 통과했다. 밖으로 쓰려던 요청은 거절되고 알림으로 올라왔다 |
 | 알림 | 동기 콜백·`STATUS.md`·표준 오류. 전달이 실패하면 다음 tick 에 다시 보낸다 |

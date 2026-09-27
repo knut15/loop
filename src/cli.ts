@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import type { Adapter } from './adapter.ts';
-import { CliAdapter, readOutput, type CliKind } from './cli-adapter.ts';
+import { CliAdapter, readDenials, readOutput, type CliKind } from './cli-adapter.ts';
+import { capability, DEFAULT_ACCESS, WORKER_ACCESS, type WorkerAccess } from './policy.ts';
 import { FakeAdapter } from './fake-adapter.ts';
 import { acquireManagerLock } from './lock.ts';
 import { commandIntegrator, inOrderCoordinator, runLoop, type Coordinator } from './loop.ts';
@@ -16,6 +17,8 @@ import { Manager, type ManagerOptions, type Notify } from './manager.ts';
 const USAGE = `사용법:
   loop-ai init <dir> --adapter claude|codex [--model <모델>]
                [--coordinator order|llm] [--coordinator-cli claude|codex] [--coordinator-model <모델>]
+               [--worker-access read-only|workspace-write|full]
+  loop-ai policy <dir> [read-only|workspace-write|full]   (값 없이 부르면 현재 정책을 보여 준다)
   loop-ai goal <dir> <목표 문장 | @파일>
   loop-ai add <dir> <작업ID> --prompt <프롬프트> [--after <작업ID,...>] [--decision <결정ID>] [--max-attempts <n>]
   loop-ai run <dir> --verify <검증 명령> [--max <동시 실행 수>] [--interval <ms>] [--stall-minutes <분>]
@@ -28,6 +31,8 @@ type Config = {
   adapter: CliKind | 'fake'; model?: string;
   // order: 추가된 순서대로 실행하는 규칙 기반 총괄. llm: goal 을 읽고 작업을 나누는 LLM 총괄
   coordinator?: { kind: 'order' } | { kind: 'llm'; cli: CliKind; model?: string };
+  // 작업자 권한 정책. 없으면 기본값(workspace-write)
+  workerAccess?: WorkerAccess;
 };
 
 function loadConfig(dir: string): Config {
@@ -58,7 +63,7 @@ function open(dir: string, notify?: Notify, mopts?: ManagerOptions): Manager {
     f.autoResult = 'succeeded';
     adapter = f;
   } else {
-    adapter = new CliAdapter(cfg.adapter, p.adapter, cfg.model);
+    adapter = new CliAdapter(cfg.adapter, p.adapter, cfg.model, cfg.workerAccess ?? DEFAULT_ACCESS);
   }
   return new Manager(p.db, adapter, p.work, notify, mopts);
 }
@@ -77,11 +82,14 @@ async function main(argv: string[]): Promise<number> {
       options: {
         adapter: { type: 'string' }, model: { type: 'string' },
         coordinator: { type: 'string', default: 'order' }, 'coordinator-cli': { type: 'string' }, 'coordinator-model': { type: 'string' },
+        'worker-access': { type: 'string', default: DEFAULT_ACCESS },
       },
     });
     const kind = values.adapter as Config['adapter'];
     if (!['claude', 'codex', 'fake'].includes(kind)) throw new Error('--adapter 는 claude 또는 codex 다');
     if (existsSync(p.config)) throw new Error(`이미 초기화됐다: ${p.root}`);
+    const workerAccess = values['worker-access'] as WorkerAccess;
+    if (!WORKER_ACCESS.includes(workerAccess)) throw new Error(`--worker-access 는 ${WORKER_ACCESS.join('|')} 다`);
     let coordinator: Config['coordinator'] = { kind: 'order' };
     if (values.coordinator === 'llm') {
       const cli = (values['coordinator-cli'] ?? (kind === 'fake' ? undefined : kind)) as CliKind | undefined;
@@ -91,11 +99,33 @@ async function main(argv: string[]): Promise<number> {
       throw new Error('--coordinator 는 order 또는 llm 이다');
     }
     mkdirSync(p.root, { recursive: true });
-    writeFileSync(p.config, JSON.stringify({ adapter: kind, model: values.model, coordinator }, null, 2));
+    writeFileSync(p.config, JSON.stringify({ adapter: kind, model: values.model, coordinator, workerAccess }, null, 2));
     if (kind === 'fake') FakeAdapter.init(p.adapter);
-    else CliAdapter.init(kind, p.adapter, values.model);
+    else CliAdapter.init(kind, p.adapter, values.model, workerAccess);
+    if (workerAccess === 'full') console.error('경고: 작업자 권한이 full 이다. 작업자가 파일·명령·네트워크를 제한 없이 쓴다');
     open(dir).close();
     console.log(`초기화: ${p.root}`);
+    return 0;
+  }
+
+  if (cmd === 'policy') {
+    const cfg = loadConfig(dir);
+    const level = rest[0] as WorkerAccess | undefined;
+    if (!level) {
+      console.log(`작업자 권한: ${cfg.workerAccess ?? DEFAULT_ACCESS}`);
+      return 0;
+    }
+    if (!WORKER_ACCESS.includes(level)) throw new Error(`정책은 ${WORKER_ACCESS.join('|')} 중 하나다`);
+    const before = cfg.workerAccess ?? DEFAULT_ACCESS;
+    writeFileSync(p.config, JSON.stringify({ ...cfg, workerAccess: level }, null, 2));
+    const m = open(dir);
+    try {
+      m.noteCoordinator('policy_changed', `작업자 권한 ${before} → ${level}`);
+    } finally {
+      m.close();
+    }
+    if (level === 'full') console.error('경고: 작업자 권한이 full 이다. 작업자가 파일·명령·네트워크를 제한 없이 쓴다');
+    console.log(`작업자 권한: ${before} → ${level}. 다음에 띄우는 작업자부터 적용된다`);
     return 0;
   }
 
@@ -156,6 +186,7 @@ async function main(argv: string[]): Promise<number> {
     if (cfg.coordinator?.kind === 'llm') {
       if (!m.goal()) throw new Error('LLM 총괄은 목표가 필요하다. 먼저 loop-ai goal 을 돌린다');
       const workerKind = cfg.adapter === 'fake' ? undefined : cfg.adapter;
+      const cap = workerKind ? capability(workerKind, cfg.workerAccess ?? DEFAULT_ACCESS) : undefined;
       coordinator = llmCoordinator(cliRunner(cfg.coordinator.cli, cfg.coordinator.model), () => {
         const out: Record<string, string> = {};
         for (const t of m.tasks().filter((x) => x.state === 'done')) {
@@ -164,7 +195,7 @@ async function main(argv: string[]): Promise<number> {
           if (text !== undefined) out[t.id] = text;
         }
         return out;
-      });
+      }, cap);
     }
     const ac = new AbortController();
     process.once('SIGINT', () => ac.abort());
@@ -172,6 +203,7 @@ async function main(argv: string[]): Promise<number> {
     try {
       const r = await runLoop(m, {
         coordinator,
+        readDenials: cfg.adapter === 'fake' ? undefined : (a) => readDenials(cfg.adapter as CliKind, a.workdir),
         integrator: commandIntegrator(values.verify),
         maxConcurrent: Number(values.max),
         intervalMs: Number(values.interval),

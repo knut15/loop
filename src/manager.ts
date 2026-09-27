@@ -158,7 +158,7 @@ export class Manager {
   // 작업 상태를 바꾼 기록만 센 마지막 번호. 알림·거절·총괄 실패 같은 기록은 총괄을 다시 부를 이유가 아니다
   stateSeq(): number {
     return (this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM history
-      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called')`).get() as { n: number }).n;
+      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied')`).get() as { n: number }).n;
   }
 
   attemptCounts(): Record<string, number> {
@@ -182,6 +182,10 @@ export class Manager {
 
   clearFlagPrefix(prefix: string): void {
     this.db.prepare(`UPDATE flags SET active = 0 WHERE key LIKE ? || '%'`).run(prefix);
+  }
+
+  noteDenied(taskId: string, attemptId: string, denied: string[]): void {
+    this.log(taskId, attemptId, 'permission_denied', denied.join(', ').slice(0, 300));
   }
 
   // 총괄 호출에 관한 기록. 작업에 묶이지 않는다

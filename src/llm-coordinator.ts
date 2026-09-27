@@ -40,7 +40,7 @@ type RawProposal = {
 };
 type RawPlan = { reasoning: string; goal_complete: boolean; proposals: RawProposal[] };
 
-export function buildPrompt(s: Snapshot & { outputs: Record<string, string> }): string {
+export function buildPrompt(s: Snapshot & { outputs: Record<string, string>; capability?: string }): string {
   const view = {
     goal: s.goal,
     capacity: s.capacity,
@@ -61,7 +61,7 @@ You only decide. You never do the work yourself. Reply with a plan that matches 
 How workers run:
 - Each task runs one coding-agent CLI invocation in its own empty directory, with no memory of other tasks.
 - A worker sees only its task prompt. If a task needs another task's result, make it depend on that task. When you dispatch it later, put the complete prompt in "prompt" with the needed result copied in from "result". Otherwise set "prompt" to null on dispatch to use the stored prompt.
-- Workers currently cannot create or edit files or run commands. They can only reply with text. Ask for results in the reply text.
+- ${s.capability ?? 'Workers cannot create or edit files or run commands. They can only reply with text.'} Ask only for what workers can do.
 - A task is verified by a command after it finishes. Only verified tasks become "done".
 
 Rules:
@@ -88,11 +88,12 @@ function toProposal(p: RawProposal): Proposal {
   return p as unknown as Proposal;
 }
 
-export function llmCoordinator(runner: LlmRunner, readOutputs: () => Record<string, string> = () => ({})): Coordinator {
+// capability: 작업자가 권한 정책상 할 수 있는 일 (policy.ts 의 capability). 총괄이 할 수 없는 일을 시키지 않게 한다
+export function llmCoordinator(runner: LlmRunner, readOutputs: () => Record<string, string> = () => ({}), capability?: string): Coordinator {
   return {
     decidesCompletion: true,
     async propose(s: Snapshot): Promise<Plan> {
-      const raw = (await runner(buildPrompt({ ...s, outputs: readOutputs() }), PLAN_SCHEMA)) as RawPlan;
+      const raw = (await runner(buildPrompt({ ...s, outputs: readOutputs(), capability }), PLAN_SCHEMA)) as RawPlan;
       if (!raw || typeof raw !== 'object' || !Array.isArray(raw.proposals) || typeof raw.goal_complete !== 'boolean') {
         throw new Error('총괄 응답이 스키마에 맞지 않는다');
       }

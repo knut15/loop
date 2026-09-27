@@ -71,6 +71,8 @@ export type LoopOptions = {
   maxTicks?: number;
   // 매 tick 끝에 부른다. CLI 는 여기서 STATUS.md 를 갱신한다
   onTick?: (m: Manager) => void;
+  // 끝난 시도에서 권한 밖이라 거절당한 요청을 읽는다. 있으면 조용히 넘기지 않고 알린다
+  readDenials?: (a: Attempt) => string[];
 };
 
 export type LoopResult = { status: 'done' | 'stopped' | 'max_ticks'; ticks: number };
@@ -84,6 +86,7 @@ const COORDINATOR_FAILURE_ALERT = 3;
 
 export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
   await m.recover();
+  if (opts.readDenials) checkDenials(m, opts.readDenials);
 
   for (const t of m.tasks().filter((x) => x.state === 'integrating')) {
     const a = m.lastSucceeded(t.id);
@@ -95,6 +98,25 @@ export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
   await consult(m, opts);
   // 새로 생긴 멈춤(시도 상한, 총괄 실패 등)은 제안을 적용한 뒤에도 확인한다
   m.alertIfNeeded();
+}
+
+// 끝난 시도마다 한 번씩 권한 거절을 확인한다. 거절은 작업을 멈추지 않지만, 정책 밖 행동이 필요했다는
+// 뜻이라 사용자가 알아야 한다. 재시도마다 알리지 않도록 작업마다 한 번만 알리고, 그 작업이 done 이 되면 내린다
+function checkDenials(m: Manager, read: (a: Attempt) => string[]): void {
+  for (const t of m.tasks()) {
+    if (t.state === 'done') m.clearFlag(`denied:${t.id}`);
+    for (const a of m.attempts(t.id)) {
+      if (a.status !== 'succeeded' && a.status !== 'failed') continue;
+      const key = `denials_checked:${a.id}`;
+      if (m.meta(key)) continue;
+      m.setMeta(key, '1');
+      const denied = read(a);
+      if (denied.length === 0 || t.state === 'done') continue;
+      m.noteDenied(t.id, a.id, denied);
+      m.setFlag(`denied:${t.id}`, t.id, `작업자가 권한 밖 요청 ${denied.length}건을 거절당했다: ${denied.slice(0, 3).join(', ')}`,
+        '작업 결과가 목표에 모자라면 작업을 나누거나 프롬프트를 고친다. 정말 필요한 권한이면 loop-ai policy 로 수준을 올린다');
+    }
+  }
 }
 
 // 상태가 바뀌었을 때만 총괄을 부른다. LLM 총괄은 부를 때마다 비용이 들기 때문이다
