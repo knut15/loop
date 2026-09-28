@@ -8,6 +8,7 @@ import { Manager } from '../src/manager.ts';
 import { FakeAdapter } from '../src/fake-adapter.ts';
 import { runLoop, tick, workspaceIntegrator } from '../src/loop.ts';
 import { GitWorkspace, INTEGRATION_BRANCH } from '../src/workspace.ts';
+import { buildPrompt } from '../src/llm-coordinator.ts';
 
 // 실제 git 저장소에서 worktree 전달·통합·검증을 확인한다
 
@@ -155,4 +156,29 @@ test('W9. 병합 충돌로 날린 시도는 돌려주고, 충돌한 작업은 �
   assert.ok(h.some((x) => x.kind === 'conflict_refund'), '충돌이 실제로 났고 시도를 돌려줬다');
   const content = r.git('show', `${INTEGRATION_BRANCH}:app.txt`).split('\n');
   assert.deepEqual(content.filter((l) => ['x', 'y', 'z'].includes(l)).sort(), ['x', 'y', 'z']);
+});
+
+test('W10. 작업자 디렉터리에 생긴 도구 상태 파일(.omc/)은 커밋하지 않고, 작업 결과만 병합한다', async () => {
+  const r = repo();
+  r.adapter.onLaunch = (req) => {
+    writeFileSync(path.join(req.workdir, 'out.txt'), 'ok\n');
+    execFileSync('sh', ['-c', 'mkdir -p .omc/state && echo x > .omc/state/s.json'], { cwd: req.workdir });
+  };
+  r.m.addTask('t', { prompt: 't' });
+  const res = await runLoop(r.m, { integrator: workspaceIntegrator(r.ws, 'test -f out.txt'), maxConcurrent: 1, intervalMs: 1, maxTicks: 10 });
+  assert.equal(res.status, 'done');
+  assert.deepEqual(r.git('ls-tree', '-r', '--name-only', INTEGRATION_BRANCH).split('\n').sort(), ['app.txt', 'out.txt']);
+});
+
+test('W11. 총괄에게 통합 브랜치의 파일 목록과, goal 이 가리키는 파일의 내용을 보여 준다', () => {
+  const r = repo();
+  execFileSync('sh', ['-c', 'mkdir -p docs && printf "# 스펙\\nbook(slotId, user)\\n" > docs/SPEC.md && echo other > other.md && git add . && git commit -qm spec'], { cwd: r.ws.integrationDir });
+  const v = r.ws.projectView('SPEC.md 대로 구현한다');
+  assert.deepEqual(v.files.sort(), ['app.txt', 'docs/SPEC.md', 'other.md']);
+  assert.deepEqual(Object.keys(v.docs), ['docs/SPEC.md'], 'goal 이 이름을 댄 파일만 내용을 넣는다');
+  assert.match(v.docs['docs/SPEC.md']!, /book\(slotId, user\)/);
+  const prompt = buildPrompt({ goal: 'SPEC.md 대로 구현한다', tasks: [], runnable: [], capacity: 1, attempts: {}, decisions: [], history: [], outputs: {}, project: v });
+  assert.match(prompt, /"project_docs"/);
+  assert.match(prompt, /book\(slotId, user\)/);
+  assert.match(prompt, /instead of asking the user/);
 });

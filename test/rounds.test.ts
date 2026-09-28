@@ -7,7 +7,7 @@ import path from 'node:path';
 import { Manager, Rejected } from '../src/manager.ts';
 import { FakeAdapter } from '../src/fake-adapter.ts';
 import { runLoop, type LoopOptions } from '../src/loop.ts';
-import { buildPrompt } from '../src/llm-coordinator.ts';
+import { buildPrompt, llmCoordinator } from '../src/llm-coordinator.ts';
 import { runVerify, sandboxAvailable } from '../src/verify.ts';
 import type { ReviewInput, Reviewer } from '../src/reviewer.ts';
 
@@ -76,15 +76,15 @@ test('X4. goal 이 바뀌면 스펙 버전이 오르고, 옛 작업과 옛 스�
   assert.match(buildPrompt({ goal: 'v2', tasks: s.m.tasks(), runnable: [], capacity: 1, attempts: {}, decisions: [], history: [], outputs: {}, specVersion: 2 }), /"spec_version": 2/);
 });
 
-test('X5. 샌드박스 허용 경로를 주면 그곳에만 추가로 쓸 수 있다', { skip: !sandboxAvailable() }, () => {
+test('X5. 샌드박스 허용 경로를 주면 그곳에만 추가로 쓸 수 있다', { skip: !sandboxAvailable() }, async () => {
   const cwd = mkdtempSync(path.join(tmpdir(), 'loop-ai-sbx-allow-'));
   const allowed = path.join(import.meta.dirname, '..', `.loopai-sbx-probe-allow-${process.pid}`);
   const other = path.join(import.meta.dirname, '..', `.loopai-sbx-probe-other-${process.pid}`);
   mkdirSync(allowed, { recursive: true });
   try {
-    assert.equal(runVerify({ command: `echo x > '${allowed}/f'`, trusted: false }, cwd).passed, false, '허용하지 않으면 막힌다');
-    assert.equal(runVerify({ command: `echo x > '${allowed}/f'`, trusted: false, allow: [allowed] }, cwd).passed, true);
-    assert.equal(runVerify({ command: `echo x > '${other}'`, trusted: false, allow: [allowed] }, cwd).passed, false, '허용한 곳 밖은 여전히 막힌다');
+    assert.equal((await runVerify({ command: `echo x > '${allowed}/f'`, trusted: false }, cwd)).passed, false, '허용하지 않으면 막힌다');
+    assert.equal((await runVerify({ command: `echo x > '${allowed}/f'`, trusted: false, allow: [allowed] }, cwd)).passed, true);
+    assert.equal((await runVerify({ command: `echo x > '${other}'`, trusted: false, allow: [allowed] }, cwd)).passed, false, '허용한 곳 밖은 여전히 막힌다');
     assert.equal(existsSync(other), false);
   } finally {
     rmSync(allowed, { recursive: true, force: true });
@@ -100,4 +100,21 @@ test('X6. LLM 총괄로 돌릴 때 --accept 가 없으면 거절한다', () => {
   const r = run('run', dir, '--verify', 'true', '--no-desktop');
   assert.equal(r.status, 1);
   assert.match(r.stderr, /LLM 총괄을 쓸 때는 --accept 가 필요하다/);
+});
+
+test('X7. 인수 검증이 통과하면 총괄을 한 번 더 불러, 검증 결과를 본 총괄이 완료라고 하면 끝난다', async () => {
+  const s = setup();
+  s.m.setGoal('g');
+  s.m.addTask('t', { prompt: 'p' });
+  // 인수 검증 결과를 보기 전에는 끝나지 않았다고 하는 총괄
+  const runner = async (prompt: string) => {
+    const view = JSON.parse(prompt.slice(prompt.indexOf('{'))) as { runnable: string[]; tasks: { id: string; version: number }[]; last_acceptance: string | null };
+    const passed = /인수 검증 통과/.test(view.last_acceptance ?? '');
+    return {
+      reasoning: 'r', goal_complete: passed,
+      proposals: view.runnable.map((id) => ({ kind: 'dispatch', task_id: id, prompt: null, depends_on: null, blocked_by: null, expected_version: view.tasks.find((t) => t.id === id)!.version, decision_id: null, question: null, role: null, verify: null, files: null })),
+    };
+  };
+  const r = await runLoop(s.m, base({ coordinator: llmCoordinator(runner), accept: { command: 'true', run: () => ({ passed: true, output: '' }) }, maxTicks: 15 }));
+  assert.equal(r.status, 'done', '인수 검증 뒤 총괄이 완료라고 할 기회가 있어야 한다');
 });

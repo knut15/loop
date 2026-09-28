@@ -57,17 +57,17 @@ test('K2. 인수 검증이 실패하면 끝내지 않고 한 번 알린다. 고�
   assert.equal(s.m.attention().length, 0);
 });
 
-test('K3. 총괄이 제안한 검증 명령은 샌드박스에서 돌아 밖 쓰기가 막히고, 사용자 명령은 그대로 돈다', { skip: !sandboxAvailable() }, () => {
+test('K3. 총괄이 제안한 검증 명령은 샌드박스에서 돌아 밖 쓰기가 막히고, 사용자 명령은 그대로 돈다', { skip: !sandboxAvailable() }, async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'loop-ai-sbx-'));
   const outside = path.join(import.meta.dirname, '..', `.loopai-sbx-probe-${process.pid}`);
   try {
-    const inside = runVerify({ command: 'echo in > in.txt && git --version', trusted: false }, dir);
+    const inside = await runVerify({ command: 'echo in > in.txt && git --version', trusted: false }, dir);
     assert.equal(inside.passed, true, inside.output);
-    const blocked = runVerify({ command: `echo out > '${outside}'`, trusted: false }, dir);
+    const blocked = await runVerify({ command: `echo out > '${outside}'`, trusted: false }, dir);
     assert.equal(blocked.passed, false);
     assert.match(blocked.output, /Operation not permitted/);
     assert.equal(existsSync(outside), false);
-    assert.equal(runVerify({ command: `echo out > '${outside}'`, trusted: true }, dir).passed, true);
+    assert.equal((await runVerify({ command: `echo out > '${outside}'`, trusted: true }, dir)).passed, true);
     assert.equal(existsSync(outside), true);
   } finally {
     rmSync(outside, { force: true }); // 테스트가 만든 파일만 지운다
@@ -103,30 +103,30 @@ test('K5. CLI 는 --accept 만으로 돌고, --verify·--accept 가 모두 없�
 });
 
 
-test('K6. 검증 명령이 남긴 손자 프로세스가 출력 파이프를 쥐고 있어도 명령이 끝나면 곧바로 돌아온다', () => {
+test('K6. 검증 명령이 남긴 손자 프로세스가 출력 파이프를 쥐고 있어도 명령이 끝나면 곧바로 돌아온다', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'loop-ai-k6-'));
   const t0 = Date.now();
-  const r = runVerify({ command: 'sleep 30 & echo started', trusted: true }, dir);
+  const r = await runVerify({ command: 'sleep 30 & echo started', trusted: true }, dir);
   assert.equal(r.passed, true);
   assert.match(r.output, /started/);
   assert.ok(Date.now() - t0 < 10_000, `${Date.now() - t0}ms 걸렸다`);
 });
 
-test('K7. 시간 안에 끝나지 않는 검증 명령은 프로세스 그룹째 멈추고 실패로 돌려준다', () => {
+test('K7. 시간 안에 끝나지 않는 검증 명령은 프로세스 그룹째 멈추고 실패로 돌려준다', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'loop-ai-k7-'));
   const t0 = Date.now();
-  const r = runVerify({ command: 'sh -c "sleep 30"; echo never', trusted: true }, dir, 1000);
+  const r = await runVerify({ command: 'sh -c "sleep 30"; echo never', trusted: true }, dir, 1000);
   assert.equal(r.passed, false);
   assert.match(r.output, /끝나지 않아 멈췄다/);
   assert.doesNotMatch(r.output, /never/);
   assert.ok(Date.now() - t0 < 10_000, `${Date.now() - t0}ms 걸렸다`);
 });
 
-test('K8. 샌드박스에서도 이 기기 안의 HTTP 연결(localhost)은 된다', { skip: !sandboxAvailable() }, () => {
+test('K8. 샌드박스에서도 이 기기 안의 HTTP 연결(localhost)은 된다', { skip: !sandboxAvailable() }, async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'loop-ai-k8-'));
   const script = `const http=require('node:http');const s=http.createServer((q,r)=>r.end('pong'));s.listen(0,'127.0.0.1',async()=>{const t=await (await fetch('http://127.0.0.1:'+s.address().port)).text();console.log(t);s.close();});`;
   writeFileSync(path.join(dir, 'ping.cjs'), script);
-  const r = runVerify({ command: `"${process.execPath}" ping.cjs`, trusted: false }, dir, 20_000);
+  const r = await runVerify({ command: `"${process.execPath}" ping.cjs`, trusted: false }, dir, 20_000);
   assert.equal(r.passed, true, r.output);
   assert.match(r.output, /pong/);
 });

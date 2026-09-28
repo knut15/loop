@@ -225,10 +225,12 @@ export class Manager {
     return (this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS n FROM history').get() as { n: number }).n;
   }
 
-  // 작업 상태를 바꾼 기록만 센 마지막 번호. 알림·거절·총괄 실패 같은 기록은 총괄을 다시 부를 이유가 아니다
+  // 작업 상태를 바꾼 기록만 센 마지막 번호. 알림·거절·총괄 실패 같은 기록은 총괄을 다시 부를 이유가 아니다.
+  // 인수 검증 결과(통과·실패)는 센다. 검증 전에 "아직 안 끝났다"고 한 총괄이 결과를 보고 완료를 말할 기회가 없어,
+  // 모든 작업과 인수 검증이 끝난 뒤에도 루프가 멈추지 않았다
   stateSeq(): number {
     return (this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM history
-      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied', 'review_failed', 'acceptance_passed')`).get() as { n: number }).n;
+      WHERE kind NOT IN ('alerted', 'alert_failed', 'proposal_rejected', 'coordinator_failed', 'coordinator_called', 'permission_denied', 'review_failed')`).get() as { n: number }).n;
   }
 
   attemptCounts(): Record<string, number> {
@@ -289,16 +291,41 @@ export class Manager {
     return { costUsd: r.c, costKnown: r.k, costUnknown: r.u, inputTokens: r.i, outputTokens: r.o };
   }
 
-  // 예산. 값은 meta 에 둔다. 경과 시간은 예산을 정한 때부터 잰다
-  budget(): { maxMinutes?: number; maxCostUsd?: number; startedAt?: number } {
+  // 예산. 값은 meta 에 둔다.
+  // 경과 시간은 루프가 실제로 돈 시간만 센다. 예산을 정한 때부터 흐른 시계 시간으로 쟀더니, 사용자 응답을 기다린
+  // 9분과 루프가 꺼져 있던 밤사이 시간까지 예산에 들어갔다 (다음 날 다시 띄우자 경과 547분)
+  budget(): { maxMinutes?: number; maxCostUsd?: number; startedAt?: number; activeMinutes: number } {
     const n = (k: string) => (this.meta(k) ? Number(this.meta(k)) : undefined);
-    return { maxMinutes: n('budget_max_minutes'), maxCostUsd: n('budget_max_cost_usd'), startedAt: n('budget_started_at') };
+    return {
+      maxMinutes: n('budget_max_minutes'), maxCostUsd: n('budget_max_cost_usd'), startedAt: n('budget_started_at'),
+      activeMinutes: (n('budget_active_ms') ?? 0) / 60_000,
+    };
+  }
+
+  // tick 마다 부른다. 앞 tick 과의 간격을 예산 시간에 더한다. 간격이 maxGapMs 보다 길면 루프가 꺼져 있던 것으로 보고
+  // 더하지 않는다. 돌고 있는 작업자도 통합 중인 작업도 없이 사용자 결정만 기다리는 동안도 더하지 않는다
+  accrueBudgetTime(maxGapMs: number): void {
+    const now = this.now();
+    const last = this.meta('budget_last_tick');
+    this.setMeta('budget_last_tick', String(now));
+    if (!last) return;
+    const gap = now - Number(last);
+    if (gap <= 0 || gap > maxGapMs || this.waitingOnUserOnly()) return;
+    this.setMeta('budget_active_ms', String(Number(this.meta('budget_active_ms') ?? 0) + gap));
+  }
+
+  private waitingOnUserOnly(): boolean {
+    const open = this.db.prepare(`SELECT 1 FROM decisions WHERE status = 'open' LIMIT 1`).get();
+    return !!open && this.liveCount() === 0 && !this.tasks().some((t) => t.state === 'integrating') && this.runnable().length === 0;
   }
 
   setBudget(b: { maxMinutes?: number; maxCostUsd?: number; reset?: boolean }): void {
     if (b.maxMinutes !== undefined) this.setMeta('budget_max_minutes', String(b.maxMinutes));
     if (b.maxCostUsd !== undefined) this.setMeta('budget_max_cost_usd', String(b.maxCostUsd));
-    if (b.reset || !this.meta('budget_started_at')) this.setMeta('budget_started_at', String(this.now()));
+    if (b.reset || !this.meta('budget_started_at')) {
+      this.setMeta('budget_started_at', String(this.now()));
+      this.setMeta('budget_active_ms', '0');
+    }
     const cur = this.budget();
     this.log(null, null, 'budget_set', `경과 시간 상한 ${cur.maxMinutes ?? '-'}분, 비용 상한 $${cur.maxCostUsd ?? '-'}`);
   }
@@ -306,9 +333,8 @@ export class Manager {
   // 예산을 넘었으면 이유를 돌려준다
   budgetExceeded(): string | undefined {
     const b = this.budget();
-    if (b.maxMinutes !== undefined && b.startedAt !== undefined) {
-      const min = (this.now() - b.startedAt) / 60_000;
-      if (min >= b.maxMinutes) return `경과 시간 ${Math.floor(min)}분이 상한 ${b.maxMinutes}분에 닿았다`;
+    if (b.maxMinutes !== undefined && b.activeMinutes >= b.maxMinutes) {
+      return `경과 시간 ${Math.floor(b.activeMinutes)}분이 상한 ${b.maxMinutes}분에 닿았다`;
     }
     if (b.maxCostUsd !== undefined) {
       const t = this.usageTotals();
@@ -575,7 +601,7 @@ export class Manager {
   report(): string {
     return renderReport({
       at: new Date().toISOString(), tasks: this.tasks(), runnable: this.runnable(), attention: this.attention(), history: this.history(),
-      usage: this.usageTotals(), budget: this.budget(), now: this.now(),
+      usage: this.usageTotals(), budget: this.budget(),
     });
   }
 

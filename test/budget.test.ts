@@ -52,13 +52,14 @@ test('B2. 경과 시간 상한에 닿으면 새 작업을 내지 않는다. 돌�
   const opts: LoopOptions = { integrator: pass, maxConcurrent: 1, intervalMs: 1 };
   await tick(s.m, opts);
   assert.equal(s.m.liveCount(), 1);
-  clock.t += 11 * 60_000;
+  // 루프가 30초마다 돌며 11분이 지난다 (예산 시간은 루프가 실제로 돈 시간만 센다)
+  for (let i = 0; i < 22; i++) { clock.t += 30_000; await tick(s.m, opts); }
   const [a] = s.m.attempts('run');
   s.adapter.finish(a!.request_id, 'succeeded');
   for (let i = 0; i < 3; i++) await tick(s.m, opts);
   assert.equal(s.m.task('run').state, 'done'); // 돌던 작업은 끝까지 반영된다
   assert.equal(s.m.attempts('wait').length, 0); // 새 작업은 내지 않았다
-  assert.match(s.notes.at(-1)!, /경과 시간 11분이 상한 10분에 닿았다/);
+  assert.ok(s.notes.some((n) => /경과 시간 10분이 상한 10분에 닿았다/.test(n)), '상한에 닿는 tick 에 알린다');
 });
 
 test('B3. 비용을 모르는 호출(Codex)은 따로 세고, 비용 상한 판정에서 빠졌다고 알린다', () => {
@@ -70,4 +71,24 @@ test('B3. 비용을 모르는 호출(Codex)은 따로 세고, 비용 상한 판�
   assert.deepEqual([t.costKnown, t.costUnknown, t.inputTokens], [1, 1, 100]);
   assert.match(s.m.budgetExceeded()!, /비용을 모르는 호출 1건은 빠져 있다/);
   assert.match(s.m.report(), /비용을 모르는 호출: 1회/);
+});
+
+test('B4. 예산 시간은 루프가 꺼져 있던 공백과 사용자 결정만 기다리는 시간을 세지 않는다', async () => {
+  const clock = { t: 1_000_000 };
+  const s = setup(clock);
+  s.m.setBudget({ maxMinutes: 10 });
+  const opts: LoopOptions = { integrator: pass, maxConcurrent: 1, intervalMs: 1 };
+  s.m.addTask('q', { prompt: 'x', blockedBy: 'db' });
+  s.m.openDecision('db', '무엇을 쓸까요?');
+  await tick(s.m, opts);
+  for (let i = 0; i < 10; i++) { clock.t += 30_000; await tick(s.m, opts); }
+  assert.equal(s.m.budget().activeMinutes, 0, '결정만 기다리는 5분은 세지 않는다');
+  clock.t += 8 * 60 * 60_000; // 밤사이 꺼져 있었다
+  await tick(s.m, opts);
+  assert.equal(s.m.budget().activeMinutes, 0, '꺼져 있던 공백은 세지 않는다');
+  s.m.answerDecision('db', 1, 'sqlite');
+  s.adapter.autoResult = undefined;
+  await tick(s.m, opts);
+  for (let i = 0; i < 4; i++) { clock.t += 30_000; await tick(s.m, opts); }
+  assert.equal(s.m.budget().activeMinutes, 2, '작업자가 도는 2분은 센다');
 });

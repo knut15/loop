@@ -22,7 +22,9 @@ const CLAUDE_ISOLATE = ['--strict-mcp-config'];
 const CODEX_ISOLATE = ['--ignore-user-config'];
 
 // Claude Code 샌드박스 설정. 샌드박스 밖으로 빠져나가는 명령은 허용하지 않는다
-export const CLAUDE_SANDBOX = JSON.stringify({ sandbox: { enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false } });
+// allowLocalBinding: 이 기기 안에서 포트를 열고 붙는 것만 허용한다. 없으면 HTTP 서버 테스트가 EPERM 으로 막혀 작업자가
+// 자기가 만든 서버를 시험하지 못했다. 바깥 연결은 그대로 막힌다 (curl https://example.com → 000)
+export const CLAUDE_SANDBOX = JSON.stringify({ sandbox: { enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, network: { allowLocalBinding: true } } });
 
 export function claudeArgs(access: WorkerAccess): string[] {
   // dontAsk: 허용 목록에 없는 도구 요청은 기다리지 않고 거절한다. 기다리면 -p 실행이 출력 없이 멈춘다

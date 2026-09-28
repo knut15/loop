@@ -17,7 +17,7 @@ test('P1. 정책 수준마다 CLI 가 직접 강제하는 옵션으로 옮긴다
   // Bash 는 샌드박스 설정과 함께일 때만 허용한다
   assert.ok(ws.includes('Bash'));
   const settings = JSON.parse(ws[ws.indexOf('--settings') + 1]!);
-  assert.deepEqual(settings.sandbox, { enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false });
+  assert.deepEqual(settings.sandbox, { enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, network: { allowLocalBinding: true } });
   assert.equal(ws.at(-1), '--'); // 프롬프트가 --allowedTools 값으로 먹히지 않게 한다
   assert.ok(!claudeArgs('read-only').includes('Write'));
   assert.deepEqual(codexArgs('workspace-write'), ['--ignore-user-config', '-s', 'workspace-write']);

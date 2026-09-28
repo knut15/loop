@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { isFinished, Rejected, type Attempt, type Manager, type Task, type Usage } from './manager.ts';
 import type { HistoryEntry } from './report.ts';
-import type { IntegrationResult, Workspace } from './workspace.ts';
+import type { IntegrationResult, ProjectView, Workspace } from './workspace.ts';
 import type { Reviewer } from './reviewer.ts';
 import type { VerifyCommand, VerifyResult } from './verify.ts';
 
@@ -35,6 +35,8 @@ export type Snapshot = {
   // 작업별 요약 (시도 횟수, 마지막 반려·재작업 이유, 취소 이유)
   notes?: ReturnType<Manager['taskNotes']>;
   specVersion?: number;
+  // 통합된 프로젝트의 파일 목록과 goal 이 가리키는 파일의 내용 (git 작업 공간)
+  project?: ProjectView;
 };
 
 export interface Coordinator {
@@ -102,7 +104,7 @@ export type LoopOptions = {
   // 검토자에게 보여 줄 변경 내용과 작업자의 마지막 응답
   changes?: (a: Attempt) => string;
   // 검토 전에 작업자의 작업 사본에서 작업별 검증을 돌린다 (의견 차이를 줄이는 짧은 실험)
-  preCheck?: (t: Task, a: Attempt) => { passed: boolean; output: string } | undefined;
+  preCheck?: (t: Task, a: Attempt) => VerifyResult | undefined | Promise<VerifyResult | undefined>;
   readOutput?: (a: Attempt) => string | undefined;
   // 역할 이름 → 역할 지침. dispatch 할 때 작업 프롬프트 앞에 붙인다
   roles?: Record<string, string>;
@@ -110,8 +112,13 @@ export type LoopOptions = {
   workerNote?: string;
   // 끝난 작업자 시도의 사용량을 읽는다. 예산 계산에 쓴다
   readUsage?: (a: Attempt) => Usage | undefined;
+  // 총괄에게 보여 줄 프로젝트 파일 (GitWorkspace.projectView)
+  readProject?: (goal: string) => ProjectView;
   // 전체 인수 검증. 모든 작업이 done 이 된 뒤 돌리고, 통과해야 루프가 끝난다
-  accept?: { command: string; run: () => VerifyResult };
+  accept?: { command: string; run: () => VerifyResult | Promise<VerifyResult> };
+  // true 면 검토·통합 검증·인수 검증을 tick 과 따로 돌린다. 그동안에도 tick 은 복구·멈춤 알림·예산 확인·dispatch 를 한다.
+  // false(기본)면 tick 안에서 끝날 때까지 기다린다 (테스트가 한 tick 의 결과를 바로 확인할 수 있게)
+  backgroundVerify?: boolean;
 };
 
 export type LoopResult = { status: 'done' | 'stopped' | 'max_ticks'; ticks: number };
@@ -124,13 +131,37 @@ const ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 // 총괄 호출이 이만큼 연속 실패하면 멈춤으로 알린다
 const COORDINATOR_FAILURE_ALERT = 3;
 
-export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
-  // CLI 명령이 넣어 둔 요청을 먼저 반영한다. 상태를 고치는 것은 잠금을 쥔 루프 하나다
-  m.applyRequests();
-  await m.recover();
-  if (opts.readDenials) checkDenials(m, opts.readDenials);
-  if (opts.readUsage) recordWorkerUsage(m, opts.readUsage);
+// 검증 작업(검토·통합 검증·인수 검증)은 Manager 마다 하나만 돈다. 통합과 인수 검증이 같은 통합 worktree 를 쓰기 때문이다
+const jobs = new WeakMap<Manager, Promise<void>>();
+const jobErrors = new WeakMap<Manager, unknown>();
 
+async function runJob(m: Manager, opts: LoopOptions, work: () => Promise<void>): Promise<void> {
+  if (jobs.has(m)) return; // 앞 작업이 아직 돈다. 다음 tick 에 다시 본다
+  const job = work()
+    .catch((e) => { jobErrors.set(m, e); })
+    .finally(() => { jobs.delete(m); });
+  jobs.set(m, job);
+  if (!opts.backgroundVerify) {
+    await job;
+    rethrowJobError(m);
+  }
+}
+
+// 검증 작업에서 난 예외는 다음 tick 에서 다시 던진다. 따로 돈다고 오류를 조용히 삼키지 않는다
+function rethrowJobError(m: Manager): void {
+  if (!jobErrors.has(m)) return;
+  const e = jobErrors.get(m);
+  jobErrors.delete(m);
+  throw e;
+}
+
+// 돌고 있는 검증 작업이 끝날 때까지 기다린다. 루프를 끝내기 전에 부른다
+export async function settleJobs(m: Manager): Promise<void> {
+  await jobs.get(m);
+  rethrowJobError(m);
+}
+
+async function integratePending(m: Manager, opts: LoopOptions): Promise<void> {
   for (const t of m.tasks().filter((x) => x.state === 'integrating')) {
     const a = m.lastSucceeded(t.id);
     if (!a) continue;
@@ -142,9 +173,23 @@ export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
     if (r.alert) m.setFlag(`integration:${t.id}`, t.id, r.alert.reason, r.alert.next);
     if (r.passed) m.clearFlag(`integration:${t.id}`);
   }
+}
+
+export async function tick(m: Manager, opts: LoopOptions): Promise<void> {
+  rethrowJobError(m);
+  // CLI 명령이 넣어 둔 요청을 먼저 반영한다. 상태를 고치는 것은 잠금을 쥔 루프 하나다
+  m.applyRequests();
+  // 예산 시간은 루프가 실제로 돈 시간만 센다. tick 간격의 세 배(최소 1분)보다 긴 공백은 꺼져 있던 시간으로 본다
+  m.accrueBudgetTime(Math.max(opts.intervalMs * 3, 60_000));
+  await m.recover();
+  if (opts.readDenials) checkDenials(m, opts.readDenials);
+  if (opts.readUsage) recordWorkerUsage(m, opts.readUsage);
+
+  if (m.tasks().some((x) => x.state === 'integrating')) await runJob(m, opts, () => integratePending(m, opts));
 
   await consult(m, opts);
-  if (opts.accept) checkAcceptance(m, opts.accept);
+  const accept = opts.accept;
+  if (accept && acceptanceDue(m)) await runJob(m, opts, () => checkAcceptance(m, accept));
   checkIdle(m);
   // 새로 생긴 멈춤(시도 상한, 총괄 실패 등)은 제안을 적용한 뒤에도 확인한다
   m.alertIfNeeded();
@@ -172,12 +217,14 @@ function checkIdle(m: Manager): void {
 
 // 모든 작업이 done 이면 인수 검증을 돌린다. 같은 상태에서는 한 번만 돌린다.
 // 실패하면 출력을 히스토리에 남겨 총괄이 고칠 작업을 추가할 수 있게 하고, 사용자에게도 알린다
-function checkAcceptance(m: Manager, accept: NonNullable<LoopOptions['accept']>): void {
+function acceptanceDue(m: Manager): boolean {
   const tasks = m.tasks();
-  if (tasks.length === 0 || !tasks.every(isFinished)) return;
-  const seq = String(m.stateSeq());
-  if (m.meta('accept_seq') === seq) return;
-  const r = accept.run();
+  return tasks.length > 0 && tasks.every(isFinished) && m.meta('accept_seq') !== String(m.stateSeq());
+}
+
+async function checkAcceptance(m: Manager, accept: NonNullable<LoopOptions['accept']>): Promise<void> {
+  if (!acceptanceDue(m)) return;
+  const r = await accept.run();
   const out = r.output.split('\n').filter(Boolean).slice(-5).join(' | ').slice(0, 400) || '(출력 없음)';
   if (r.passed) {
     m.noteCoordinator('acceptance_passed', `인수 검증 통과: ${accept.command}`);
@@ -203,7 +250,7 @@ async function review(m: Manager, opts: LoopOptions, t: Task, a: Attempt): Promi
   if (m.meta(key)) return true;
   let v;
   try {
-    const pre = opts.preCheck?.(t, a);
+    const pre = await opts.preCheck?.(t, a);
     const evidence = pre ? `${pre.passed ? 'PASSED' : 'FAILED'}${pre.output ? `: ${pre.output.slice(-800)}` : ''}` : undefined;
     const input = { goal: m.goal(), taskId: t.id, prompt: a.prompt, changes: opts.changes?.(a) ?? '', output: opts.readOutput?.(a), evidence };
     v = await opts.reviewer!(input);
@@ -313,6 +360,7 @@ async function consult(m: Manager, opts: LoopOptions): Promise<void> {
       lastAcceptance: m.lastAcceptance(),
       notes: m.taskNotes(),
       specVersion: m.specVersion(),
+      project: opts.readProject?.(m.goal()),
     });
     if (!plan || !Array.isArray(plan.proposals)) throw new Error('제안 형식이 아니다');
   } catch (e) {
@@ -409,21 +457,30 @@ async function applyPlan(m: Manager, plan: Plan, capacity: number, opts: LoopOpt
 export async function runLoop(m: Manager, opts: LoopOptions): Promise<LoopResult> {
   const coordinator = opts.coordinator ?? inOrderCoordinator;
   let ticks = 0;
-  while (true) {
-    if (opts.signal?.aborted) return { status: 'stopped', ticks };
-    await tick(m, opts);
-    ticks++;
-    opts.onTick?.(m);
-    const tasks = m.tasks();
-    const allDone = tasks.length > 0 && tasks.every(isFinished);
-    const accepted = !opts.accept || (m.meta('accept_passed') === '1' && m.meta('accept_seq') === String(m.stateSeq()));
-    if (allDone && accepted && (!coordinator.decidesCompletion || m.meta('goal_complete') === '1')) return { status: 'done', ticks };
-    if (opts.maxTicks !== undefined && ticks >= opts.maxTicks) return { status: 'max_ticks', ticks };
-    // 멈춘 작업만 남아도 끝내지 않는다. 사용자 응답·판정이 들어오면 다음 tick 에서 이어 간다
-    try {
-      await sleep(opts.intervalMs, undefined, { signal: opts.signal });
-    } catch {
-      return { status: 'stopped', ticks };
+  try {
+    return await loop();
+  } finally {
+    // 따로 돌던 검증 작업이 끝난 뒤에 돌려준다. 호출한 쪽이 곧바로 DB 를 닫는다
+    await settleJobs(m);
+  }
+
+  async function loop(): Promise<LoopResult> {
+    while (true) {
+      if (opts.signal?.aborted) return { status: 'stopped', ticks };
+      await tick(m, opts);
+      ticks++;
+      opts.onTick?.(m);
+      const tasks = m.tasks();
+      const allDone = tasks.length > 0 && tasks.every(isFinished);
+      const accepted = !opts.accept || (m.meta('accept_passed') === '1' && m.meta('accept_seq') === String(m.stateSeq()));
+      if (allDone && accepted && (!coordinator.decidesCompletion || m.meta('goal_complete') === '1')) return { status: 'done', ticks };
+      if (opts.maxTicks !== undefined && ticks >= opts.maxTicks) return { status: 'max_ticks', ticks };
+      // 멈춘 작업만 남아도 끝내지 않는다. 사용자 응답·판정이 들어오면 다음 tick 에서 이어 간다
+      try {
+        await sleep(opts.intervalMs, undefined, { signal: opts.signal });
+      } catch {
+        return { status: 'stopped', ticks };
+      }
     }
   }
 }

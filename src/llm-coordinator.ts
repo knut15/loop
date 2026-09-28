@@ -67,6 +67,9 @@ export function buildPrompt(s: Snapshot & { outputs: Record<string, string>; cap
       result: needed.has(t.id) ? s.outputs[t.id] : s.outputs[t.id]?.slice(0, SHORT_RESULT),
     })),
     finished_tasks_omitted: finished.length - shown.length,
+    project_files: s.project?.files ?? null,
+    project_files_omitted: s.project?.filesOmitted ?? 0,
+    project_docs: s.project?.docs ?? {},
     tasks: open.map((t) => ({
       id: t.id, state: t.state, version: t.version,
       depends_on: t.depends_on ? t.depends_on.split(',') : [], blocked_by: t.blocked_by,
@@ -90,6 +93,7 @@ How workers run:
 - A worker sees only its task prompt. If a task needs another task's result, make it depend on that task. When you dispatch it later, put the complete prompt in "prompt" with the needed result copied in from "result". Otherwise set "prompt" to null on dispatch to use the stored prompt.
 - ${s.capability ?? 'Workers cannot create or edit files or run commands. They can only reply with text.'} Ask only for what workers can do.
 - A task is verified by a command after it finishes. Only verified tasks become "done".
+- "project_files" lists the files in the integrated project, and "project_docs" holds the contents of files the goal mentions. Read them instead of asking the user for their contents.
 - "tasks" lists unfinished tasks in full. "finished_tasks" lists done or cancelled tasks briefly; the oldest are left out and counted in "finished_tasks_omitted". Their ids stay taken.
 
 Rules:
@@ -100,7 +104,7 @@ Rules:
 5. Set goal_complete to true only when every task is done or cancelled and their results satisfy the goal. Otherwise false.
    If a ready or blocked task is no longer needed (for example an earlier plan was replaced), cancel it with kind "cancel_task" (task_id, and the reason in "prompt"). Unfinished tasks keep the loop from finishing.
 6. If "roles" is not empty, set "role" on add_task to the role that fits the task best, or null. Use only listed role names.
-7. Give each add_task a "verify" shell command that checks only that task's own result in the integrated project tree (for example: test -f add.sh && [ "$(sh add.sh 2 3)" = 5 ]). It must pass once this task alone is merged, even if other tasks are not done yet. It runs in a sandbox with no network. Use null if there is nothing to check.
+7. Give each add_task a "verify" shell command that checks only that task's own result in the integrated project tree (for example: test -f add.sh && [ "$(sh add.sh 2 3)" = 5 ]). It must pass once this task alone is merged, even if other tasks are not done yet. It may rely only on this task's own files and on tasks listed in its depends_on. If the check needs another task's code (for example a test that imports that task's module), put that task in depends_on, or choose a check that does not need it. It runs in a sandbox with no network. Use null if there is nothing to check.
 8. Each task has "notes": attempts so far, the last reviewer rejection and the last rework reason. Use them instead of repeating a failing prompt. If a task's spec_version is older than the current "spec_version", the goal has changed since it was created; cancel or replace it if it no longer fits.
 9. "acceptance_command" (if set) checks the whole goal after every task is done. If "recent_history" shows acceptance_failed, add tasks that fix the failure instead of repeating finished ones.
 10. Give each add_task "files": the paths (or globs such as src/api/*.js) it will create or change. Split tasks so their files do not overlap when you can; tasks whose files overlap never run at the same time, and parallel edits to one file cause merge conflicts. Use null only if you cannot tell.

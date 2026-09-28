@@ -10,11 +10,10 @@ type ReportInput = {
   attention: Attention[];
   history: HistoryEntry[];
   usage?: { costUsd: number; costKnown: number; costUnknown: number; inputTokens: number; outputTokens: number };
-  budget?: { maxMinutes?: number; maxCostUsd?: number; startedAt?: number };
-  now?: number;
+  budget?: { maxMinutes?: number; maxCostUsd?: number; startedAt?: number; activeMinutes?: number };
 };
 
-export function renderReport({ at, tasks, runnable, attention, history, usage, budget, now }: ReportInput): string {
+export function renderReport({ at, tasks, runnable, attention, history, usage, budget }: ReportInput): string {
   const lines: string[] = [`# loop-ai 상태 보고 (${at})`, ''];
 
   lines.push(`## 멈춘 곳 (${attention.length})`, '');
@@ -32,7 +31,7 @@ export function renderReport({ at, tasks, runnable, attention, history, usage, b
     if (usage.costUnknown) lines.push(`- 비용을 모르는 호출: ${usage.costUnknown}회 (Codex 는 토큰 수만 준다)`);
     lines.push(`- 토큰: 입력 ${usage.inputTokens}, 출력 ${usage.outputTokens}`);
     if (budget?.maxMinutes !== undefined || budget?.maxCostUsd !== undefined) {
-      const min = budget.startedAt !== undefined && now !== undefined ? Math.floor((now - budget.startedAt) / 60_000) : '-';
+      const min = budget.activeMinutes !== undefined ? Math.floor(budget.activeMinutes) : '-';
       lines.push(`- 예산: 경과 ${min}분 / 상한 ${budget.maxMinutes ?? '-'}분, 비용 상한 $${budget.maxCostUsd ?? '-'}`);
     }
     lines.push('');

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 
 // 검증 명령을 실행한다.
@@ -12,24 +12,6 @@ export type VerifyResult = { passed: boolean; output: string };
 
 const TIMEOUT_MS = 10 * 60_000;
 const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
-
-// 검증 명령을 자기 프로세스 그룹에서 돌리고, 끝나거나 시간이 지나면 그룹 전체를 죽이는 감싸개.
-// spawnSync 만 쓰면 두 가지가 문제였다. 명령이 끝나도 손자 프로세스가 출력 파이프를 쥐고 있으면 시간 상한까지 기다리고,
-// 시간 상한에서는 바로 아래 자식(sh)만 죽어 손자(node --test 등)가 남는다. 실제 프로젝트에서 멈춘 http 테스트가
-// 루프를 몇 분씩 세웠고, run 을 다시 띄울 때마다 남은 테스트 프로세스가 늘었다
-const GROUP_RUNNER = `
-const { spawn } = require('node:child_process');
-const [ms, cmd, ...args] = process.argv.slice(1);
-const c = spawn(cmd, args, { detached: true, stdio: 'inherit' });
-const killGroup = () => { try { process.kill(-c.pid, 'SIGKILL'); } catch {} };
-let timedOut = false;
-const t = setTimeout(() => { timedOut = true; killGroup(); }, Number(ms));
-c.on('exit', (code) => {
-  clearTimeout(t);
-  killGroup();
-  if (timedOut) process.stderr.write('\\n검증 명령이 ' + Math.round(Number(ms) / 1000) + '초 안에 끝나지 않아 멈췄다\\n');
-  process.exit(timedOut ? 124 : (code ?? 1));
-});`;
 
 export function sandboxProfile(cwd: string, allow: string[] = []): string {
   const dir = realpathSync(cwd);
@@ -45,7 +27,11 @@ export function sandboxAvailable(): boolean {
   return process.platform === 'darwin' && existsSync(SANDBOX_EXEC);
 }
 
-export function runVerify(v: VerifyCommand, cwd: string, timeoutMs = TIMEOUT_MS): VerifyResult {
+// 검증 명령을 자기 프로세스 그룹에서 비동기로 돌린다. 명령이 끝나거나 시간이 지나면 그룹 전체를 멈춘다.
+// spawnSync 로 돌렸을 때 두 가지가 문제였다. 루프가 검증이 끝날 때까지 서서 멈춤 알림·예산 확인도 돌지 않았고,
+// 시간 상한에서는 바로 아래 자식(sh)만 죽어 손자(node --test 등)가 남았다. 명령이 끝났는데 손자가 출력 파이프를
+// 쥐고 있으면 상한까지 기다리기도 했다. 실제 프로젝트에서 멈춘 http 테스트가 루프를 몇 분씩 세웠다
+export function runVerify(v: VerifyCommand, cwd: string, timeoutMs = TIMEOUT_MS): Promise<VerifyResult> {
   let cmd: string;
   let args: string[];
   if (v.trusted) {
@@ -53,13 +39,40 @@ export function runVerify(v: VerifyCommand, cwd: string, timeoutMs = TIMEOUT_MS)
     args = ['-c', v.command];
   } else {
     if (!sandboxAvailable()) {
-      return { passed: false, output: '샌드박스(sandbox-exec)를 쓸 수 없어 총괄이 제안한 검증 명령을 돌리지 않았다' };
+      return Promise.resolve({ passed: false, output: '샌드박스(sandbox-exec)를 쓸 수 없어 총괄이 제안한 검증 명령을 돌리지 않았다' });
     }
     cmd = SANDBOX_EXEC;
     args = ['-p', sandboxProfile(cwd, v.allow), 'sh', '-c', v.command];
   }
-  const r = spawnSync(process.execPath, ['-e', GROUP_RUNNER, String(timeoutMs), cmd, ...args],
-    { cwd, encoding: 'utf8', timeout: timeoutMs + 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
-  const output = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
-  return { passed: r.status === 0, output: output.slice(-2000) };
+  return new Promise((resolve) => {
+    const c = spawn(cmd, args, { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    c.stdout.on('data', (d: Buffer) => { out = (out + d.toString()).slice(-20_000); });
+    c.stderr.on('data', (d: Buffer) => { err = (err + d.toString()).slice(-20_000); });
+    const killGroup = () => { try { process.kill(-c.pid!, 'SIGKILL'); } catch { /* 이미 없다 */ } };
+    let timedOut = false;
+    let code: number | null = null;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      c.stdout.destroy();
+      c.stderr.destroy();
+      const note = timedOut ? `\n검증 명령이 ${Math.round(timeoutMs / 1000)}초 안에 끝나지 않아 멈췄다` : '';
+      resolve({ passed: !timedOut && code === 0, output: `${out}${err}${note}`.trim().slice(-2000) });
+    };
+    const timer = setTimeout(() => { timedOut = true; killGroup(); }, timeoutMs);
+    let grace: NodeJS.Timeout | undefined;
+    c.on('error', (e) => { err += String(e); finish(); });
+    c.on('exit', (n) => {
+      code = n;
+      // 명령이 남긴 프로세스까지 멈춘다. 그룹 밖으로 빠져나간 프로세스가 파이프를 쥐고 있어도 잠시 뒤 끝낸다
+      killGroup();
+      grace = setTimeout(finish, 2000);
+    });
+    c.on('close', finish);
+  });
 }

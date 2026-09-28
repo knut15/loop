@@ -20,9 +20,9 @@ export interface Workspace {
   // 시도의 작업 디렉터리를 만든다. 이미 있으면 그대로 둔다 (재시작 뒤 다시 불릴 수 있다)
   prepare(a: Attempt): void;
   // 끝난 시도를 통합하고 검증 명령을 돌린다
-  integrate(task: Task, a: Attempt, verify: VerifyCommand): IntegrationResult;
+  integrate(task: Task, a: Attempt, verify: VerifyCommand): Promise<IntegrationResult>;
   // 모든 작업이 끝난 뒤 전체 결과에 인수 검증을 돌린다 (git: 통합 트리, dir: 프로젝트 디렉터리)
-  accept(verify: VerifyCommand): VerifyResult;
+  accept(verify: VerifyCommand): Promise<VerifyResult>;
   // 검토자에게 보여 줄 변경 내용 (diff 또는 파일 목록)
   changes(a: Attempt): string;
   // 총괄에게 알려 줄 작업 디렉터리 설명
@@ -30,6 +30,8 @@ export interface Workspace {
   // 작업자에게 알려 줄 작업 디렉터리 안내. 작업 프롬프트 앞에 붙는다
   readonly workerNote: string;
 }
+
+export type ProjectView = { files: string[]; filesOmitted: number; docs: Record<string, string> };
 
 export class DirWorkspace implements Workspace {
   readonly description = 'Each worker starts in its own empty directory.';
@@ -41,7 +43,7 @@ export class DirWorkspace implements Workspace {
     this.root = root;
   }
 
-  accept(verify: VerifyCommand): VerifyResult {
+  accept(verify: VerifyCommand): Promise<VerifyResult> {
     return runVerify(verify, this.root);
   }
 
@@ -49,8 +51,8 @@ export class DirWorkspace implements Workspace {
     mkdirSync(a.workdir, { recursive: true });
   }
 
-  integrate(_task: Task, a: Attempt, verify: VerifyCommand): IntegrationResult {
-    const r = runVerify(verify, a.workdir);
+  async integrate(_task: Task, a: Attempt, verify: VerifyCommand): Promise<IntegrationResult> {
+    const r = await runVerify(verify, a.workdir);
     return { passed: r.passed, sha: 'no-git', note: `작업 디렉터리 검증 (병합 없음)${r.passed ? '' : `: ${tail(r.output)}`}` };
   }
 
@@ -69,6 +71,12 @@ export class DirWorkspace implements Workspace {
 }
 
 export const INTEGRATION_BRANCH = 'loop-ai/main';
+// 저장소의 info/exclude 에 넣어 작업자 커밋에서 빼는 경로
+const EXCLUDED = ['.loop-ai/', '.omc/'];
+// 총괄에게 보여 줄 프로젝트 파일 목록과 문서 크기 상한
+const PROJECT_FILES_MAX = 300;
+const PROJECT_DOC_MAX = 8000;
+const PROJECT_DOCS_TOTAL = 20000;
 
 export class GitWorkspace implements Workspace {
   readonly repo: string;
@@ -108,10 +116,14 @@ export class GitWorkspace implements Workspace {
   init(): void {
     const exclude = path.join(this.git(['rev-parse', '--git-common-dir']), 'info', 'exclude');
     const excludePath = path.isAbsolute(exclude) ? exclude : path.join(this.repo, exclude);
-    // .loop-ai/ 안의 worktree 가 프로젝트의 추적 대상에 섞이지 않게 한다. 추적되는 .gitignore 는 건드리지 않는다
+    // .loop-ai/ 안의 worktree 와 도구가 남기는 상태 파일(.omc/)이 프로젝트의 추적 대상에 섞이지 않게 한다.
+    // 작업자 변경은 모두 커밋하므로, 여기 없으면 작업 디렉터리에 생긴 도구 상태 파일이 그대로 병합됐다.
+    // 추적되는 .gitignore 는 건드리지 않는다
     mkdirSync(path.dirname(excludePath), { recursive: true });
-    const current = existsSync(excludePath) ? readFileSync(excludePath, 'utf8') : '';
-    if (!current.split('\n').includes('.loop-ai/')) appendFileSync(excludePath, `${current.endsWith('\n') || !current ? '' : '\n'}.loop-ai/\n`);
+    for (const entry of EXCLUDED) {
+      const current = existsSync(excludePath) ? readFileSync(excludePath, 'utf8') : '';
+      if (!current.split('\n').includes(entry)) appendFileSync(excludePath, `${current.endsWith('\n') || !current ? '' : '\n'}${entry}\n`);
+    }
 
     try {
       this.git(['rev-parse', '--verify', '--quiet', `refs/heads/${INTEGRATION_BRANCH}`]);
@@ -119,6 +131,23 @@ export class GitWorkspace implements Workspace {
       this.git(['branch', INTEGRATION_BRANCH, 'HEAD']);
     }
     if (!existsSync(this.integrationDir)) this.git(['worktree', 'add', this.integrationDir, INTEGRATION_BRANCH]);
+  }
+
+  // 총괄에게 보여 줄 프로젝트: 통합 브랜치의 파일 목록과, goal 에 경로나 파일 이름이 나온 파일의 내용.
+  // 총괄은 도구 없이 상태만 받는다. goal 이 SPEC.md 를 가리키기만 하면 내용을 몰라 사용자에게 물었다
+  projectView(goal: string): ProjectView {
+    const all = this.git(['ls-tree', '-r', '--name-only', INTEGRATION_BRANCH]).split('\n').filter(Boolean);
+    const docs: Record<string, string> = {};
+    let total = 0;
+    for (const f of all.filter((f) => goal.includes(f) || goal.includes(path.basename(f)))) {
+      if (total >= PROJECT_DOCS_TOTAL) break;
+      let text: string;
+      try { text = this.git(['show', `${INTEGRATION_BRANCH}:${f}`]); } catch { continue; }
+      const cut = text.slice(0, Math.min(PROJECT_DOC_MAX, PROJECT_DOCS_TOTAL - total));
+      docs[f] = cut.length < text.length ? `${cut}\n…(잘림: 전체 ${text.length}자)` : cut;
+      total += cut.length;
+    }
+    return { files: all.slice(0, PROJECT_FILES_MAX), filesOmitted: Math.max(0, all.length - PROJECT_FILES_MAX), docs };
   }
 
   static branchOf(a: Attempt): string {
@@ -144,11 +173,11 @@ export class GitWorkspace implements Workspace {
     return this.git(['diff', `${INTEGRATION_BRANCH}...${GitWorkspace.branchOf(a)}`]);
   }
 
-  accept(verify: VerifyCommand): VerifyResult {
+  accept(verify: VerifyCommand): Promise<VerifyResult> {
     return runVerify(verify, this.integrationDir);
   }
 
-  integrate(task: Task, a: Attempt, verify: VerifyCommand): IntegrationResult {
+  async integrate(task: Task, a: Attempt, verify: VerifyCommand): Promise<IntegrationResult> {
     const staged = this.commitWork(a);
 
     const branch = GitWorkspace.branchOf(a);
@@ -174,7 +203,7 @@ export class GitWorkspace implements Workspace {
       return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `병합 충돌 (${branch})`, conflict: true };
     }
     // 통합된 트리에서 검증한다. 실패하면 병합 전으로 되돌린다
-    const v = runVerify(verify, d);
+    const v = await runVerify(verify, d);
     if (!v.passed) {
       this.abort();
       return { passed: false, sha: this.git(['rev-parse', 'HEAD'], d), note: `통합 트리 검증 실패 (${branch}): ${tail(v.output)}` };
